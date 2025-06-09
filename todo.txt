@@ -1,0 +1,30 @@
+Overall Project Plan for ATRAC1 Codec Implementation:
+
+[x] 1. Create the foundational project structure (directories, __init__.py files, top-level files).
+[x] 2. Implement Constants and Lookup Tables:
+    [x] 2.1. Global Codec Constants (common/constants.py)
+    [x] 2.2. Spectral Mapping Tables (tables/spectral_mapping.py)
+    [x] 2.3. Scale Table (tables/scale_table.py)
+    [x] 2.4. Fixed Bit Allocation Tables (tables/bit_allocation.py)
+    [x] 2.5. QMF and MDCT Coefficients (tables/filter_coeffs.py)
+    [x] 2.6. Transient Detection Coefficients (tables/filter_coeffs.py)
+    [x] 2.7. Psychoacoustic Model Constants (tables/psychoacoustic.py)
+[ ] 3. Develop Core DSP and Psychoacoustic Components:
+    [x] 3.1. Codec Data Initialization (core/codec_data.py)
+    [x] 3.2. Sub-band Coding (QMF Analysis and Synthesis) (core/qmf.py)
+    [x] 3.3. MDCT and IMDCT (core/mdct.py)
+    [x] 3.4. Psychoacoustic Model Logic (core/psychoacoustic_model.py)
+    [x] 3.5. Transient Detection Logic (core/transient_detection.py)
+    [x] 3.6. Frame Assembly/Disassembly (pyatrac1/core/frame_assembly.py)
+    [x] 3.7. Bit Allocation Logic (core/bit_allocation_logic.py)
+    [x] 3.8. Scaling and Quantization Logic (core/scaling_quantization.py)
+    [x] 3.9. Bitstream Handling (core/bitstream.py)
+[x] 4. Implement AEA File Format Handling:
+    [x] 4.1. Metadata Header Structure (aea/metadata.py)
+    [x] 4.2. AEA Reader (aea/aea_reader.py)
+    [x] 4.3. AEA Writer (aea/aea_writer.py)
+[x] 5. Develop ATRAC1 Encoder Pipeline (encoder.py)
+[x] 6. Command-line Interface (CLI) (atrac1_cli.py)
+[ ] 7. Testing (tests/test_frame_assembly.py, and more to come)
+[ ] 8. Implement Unit and Integration Tests (tests/)
+[ ] 9. Finalize Project Configuration and Documentation.

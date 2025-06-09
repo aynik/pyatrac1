@@ -1,0 +1,11 @@
+__pycache__
+.coverage
+
+.claude
+CLAUDE.md
+
+*.aea
+*.wav
+*.log
+
+atracdenc

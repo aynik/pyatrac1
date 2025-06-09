@@ -1,0 +1,1074 @@
+```
+Comprehensive Technical Specification of the ATRAC1 Audio Codec
+This document provides a detailed, self-contained technical specification for the ATRAC1 (Adaptive TRansform Acoustic Coding) codec, a lossy audio compression algorithm developed by Sony for applications like the MiniDisc format. It is designed to enable the implementation of a full codec software from scratch, covering all constants, algorithms, encoder and decoder stages, and the AEA file structure in exhaustive detail.
+1. Introduction to ATRAC1
+This section provides a foundational understanding of the ATRAC1 codec, outlining its core principles and the key components that enable its audio compression capabilities.
+1.1. Overview and Core Principles of Operation
+ATRAC1 is a perceptually optimized audio codec that achieves efficient compression by discarding inaudible components based on psychoacoustic principles, such as masking. It processes audio in fixed 512-sample blocks per channel at a 44.1 kHz sample rate. The codec leverages a combination of sub-band coding (Quadrature Mirror Filter, QMF), transform coding (Modified Discrete Cosine Transform, MDCT), and a psychoacoustic model to maintain high audio quality within a constant bit rate (CBR).
+The operational principles of ATRAC1 are multifaceted:
+* Perceptual Coding: The codec employs psychoacoustic models to identify and discard inaudible components of the audio signal, thereby reducing the amount of data required without compromising the perceived audio quality.
+* Sub-band Coding: The input audio signal is split into three distinct frequency bands—Low, Mid, and High—through the application of a multi-stage Quadrature Mirror Filter (QMF) bank. This sub-band decomposition allows for tailored compression strategies to be applied independently to each frequency range, optimizing efficiency.
+* Transform Coding: The time-domain signals within each sub-band are converted into frequency-domain coefficients using the Modified Discrete Cosine Transform (MDCT). This transformation concentrates the signal energy into fewer coefficients, which facilitates more efficient quantization.
+* Adaptive Windowing: A critical feature for managing transient sounds, ATRAC1 dynamically switches between long (256-point for Low/Mid bands, 512-point for High band) and short (64-point) MDCT windows. This adaptation is based on the detection of transients in the audio signal, allowing the codec to balance time and frequency resolution. Shorter windows are used for transient events to minimize pre-echo artifacts, while longer windows are used for stationary segments to maximize coding gain.
+* Bit Allocation: Bits are dynamically allocated to Basic Frequency Units (BFUs) based on psychoacoustic criteria. This adaptive allocation mechanism ensures that the compressed output maintains a fixed frame size of 212 bytes, characteristic of a Constant Bit Rate (CBR) codec.
+1.2. Key Components and Their Interplay
+The architecture of the ATRAC1 codec is modular, with specialized components working in concert to achieve the compression and decompression goals.
+* QMF Bank: This component is responsible for dividing the input audio into its constituent frequency bands: Low (128 samples), Mid (128 samples), and High (256 samples). The implementation utilizes TQmf and is orchestrated by Atrac1AnalysisFilterBank for analysis and Atrac1SynthesisFilterBank for synthesis.
+* MDCT/IMDCT: The Modified Discrete Cosine Transform (MDCT) and its inverse (IMDCT) are central to converting signals between the time and frequency domains. These operations incorporate adaptive windowing and Time-Domain Aliasing Cancellation (TDAC) to ensure seamless reconstruction. The TAtrac1MDCT class manages these transformations.
+* Psychoacoustic Model: This model incorporates several functions to mimic human auditory perception, guiding the bit allocation process. Key elements include the Absolute Threshold of Hearing (ATH) calculation via ATHformula_Frank , the generation of a LoudnessCurve , analysis of spectral spread using AnalizeScaleFactorSpread , and TrackLoudness for smoothing loudness estimates.
+* Transient Detection: This component identifies sudden amplitude changes in the audio signal, which then triggers the adaptive windowing mechanism to reduce pre-echo artifacts. The TTransientDetector class performs this task, utilizing an internal High-Pass Filter (HPFilter).
+* Bit Allocation: This process dynamically distributes available bits across Basic Frequency Units (BFUs) to meet the fixed bitrate constraints while optimizing perceptual quality. The TAtrac1SimpleBitAlloc class manages this, with TBitsBooster handling the distribution of surplus bits.
+* Scaling and Quantization: Spectral coefficients are normalized and then quantized to integer mantissas during this stage. The TScaler class performs the scaling, and QuantMantisas handles the quantization. The NBitStream::MakeSign function is used to correctly handle signed integer mantissas within the bitstream.
+* Bitstream Handling: The compressed data is packed into fixed 212-byte frames, which include control data, word lengths, scale factors, and quantized coefficients. The TBitStream class manages the packing and unpacking of this data.
+2. Fundamental Constants and Lookup Tables
+The ATRAC1 codec's operation is predicated on a precise set of fixed constants and pre-computed lookup tables. Accurate replication of these values is paramount for any compliant implementation.
+2.1. Global Codec Constants
+These constants define fundamental parameters of the ATRAC1 processing unit and frame structure.
+Constant Name
+	Value
+	Description
+	Source
+	NumQMF
+	3
+	Number of QMF bands (Low, Mid, High)
+	
+
+	NumSamples
+	512
+	Samples per processing unit per channel
+	
+
+	MaxBfus
+	52
+	Maximum Basic Frequency Units across all bands
+	
+
+	SoundUnitSize
+	212
+	Bytes per compressed frame. This is the fixed size of an ATRAC1 compressed frame, emphasizing the CBR nature of the codec.
+	
+
+	BitsPerBfuAmountTabIdx
+	3
+	Bits for BFU amount index. This indicates that 8 possible BFU counts can be signaled (2^3 = 8).
+	
+
+	BitsPerIDWL
+	4
+	Bits for Individual Word Length. Each BFU's quantization word length is signaled using 4 bits, allowing for 16 different quantization levels (0-15, or 1-16 if 0 is special).
+	
+
+	BitsPerIDSF
+	6
+	Bits for Individual Scale Factor index. Each BFU's scale factor is signaled using 6 bits, pointing to one of 64 possible scale factors.
+	
+
+	AeaMetaSize
+	2048
+	Bytes for AEA file metadata header. This defines the fixed size of the metadata portion of the AEA file.
+	
+
+	delayComp
+	39
+	QMF delay compensation in samples. This constant is crucial for the QMF filter bank's perfect reconstruction properties, ensuring proper alignment of samples across stages.
+	
+
+	LoudFactor
+	0.006
+	Initial loudness factor for psychoacoustic model. This value serves as the starting point for the recursive loudness tracking.
+	
+
+	2.2. Spectral Mapping Tables
+These tables define the organization of spectral coefficients into Basic Frequency Units (BFUs) and their distribution across QMF bands, as well as their mapping to MDCT output indices. The precise arrangement of spectral data is fundamental for correct transform application and reconstruction.
+Table 2.2.1: SpecsPerBlock Values
+This array specifies the number of spectral coefficients contained within each of the 52 Basic Frequency Units. The varying sizes reflect the non-uniform spectral resolution of the codec.
+BFU Index (0-51)
+	Specs per Block
+	BFU Index (0-51)
+	Specs per Block
+	BFU Index (0-51)
+	Specs per Block
+	0-3
+	8
+	17-19
+	6
+	32-35
+	10
+	4-7
+	4
+	20-23
+	6
+	36-43
+	12
+	8-11
+	8
+	24-27
+	7
+	44-51
+	20
+	12-15
+	6
+	28-31
+	9
+	
+
+	
+
+	16
+	6
+	
+
+	
+
+	
+
+	
+
+	Table 2.2.2: BlocksPerBand Values
+This array specifies the start and end BFU indices for each of the three QMF bands.
+Band
+	Start BFU Index
+	End BFU Index (Exclusive)
+	Low (0)
+	0
+	20
+	Mid (1)
+	20
+	36
+	High (2)
+	36
+	52
+	Table 2.2.3: SpecsStartLong Values
+These indices define the starting position of each BFU's spectral data within the 512-coefficient array when using long MDCT windows.
+BFU Index
+	Start Index
+	BFU Index
+	Start Index
+	BFU Index
+	Start Index
+	BFU Index
+	Start Index
+	0
+	0
+	13
+	86
+	26
+	166
+	39
+	292
+	1
+	8
+	14
+	92
+	27
+	173
+	40
+	304
+	2
+	16
+	15
+	98
+	28
+	180
+	41
+	316
+	3
+	24
+	16
+	104
+	29
+	189
+	42
+	328
+	4
+	32
+	17
+	110
+	30
+	198
+	43
+	340
+	5
+	36
+	18
+	116
+	31
+	207
+	44
+	352
+	6
+	40
+	19
+	122
+	32
+	216
+	45
+	372
+	7
+	44
+	20
+	128
+	33
+	226
+	46
+	392
+	8
+	48
+	21
+	134
+	34
+	236
+	47
+	412
+	9
+	56
+	22
+	140
+	35
+	246
+	48
+	432
+	10
+	64
+	23
+	146
+	36
+	256
+	49
+	452
+	11
+	72
+	24
+	152
+	37
+	268
+	50
+	472
+	12
+	80
+	25
+	159
+	38
+	280
+	51
+	492
+	Table 2.2.4: SpecsStartShort Values
+These indices define the starting position of each BFU's spectral data within the 512-coefficient array when using short MDCT windows. The different indexing reflects the reordering and different block sizes used for transient handling.
+BFU Index
+	Start Index
+	BFU Index
+	Start Index
+	BFU Index
+	Start Index
+	BFU Index
+	Start Index
+	0
+	0
+	13
+	52
+	26
+	198
+	39
+	352
+	1
+	32
+	14
+	84
+	27
+	230
+	40
+	384
+	2
+	64
+	15
+	116
+	28
+	141
+	41
+	416
+	3
+	96
+	16
+	26
+	29
+	173
+	42
+	448
+	4
+	8
+	17
+	58
+	30
+	205
+	43
+	480
+	5
+	40
+	18
+	90
+	31
+	237
+	44
+	268
+	6
+	72
+	19
+	122
+	32
+	150
+	45
+	300
+	7
+	104
+	20
+	128
+	33
+	182
+	46
+	332
+	8
+	12
+	21
+	160
+	34
+	214
+	47
+	364
+	9
+	44
+	22
+	192
+	35
+	246
+	48
+	396
+	10
+	76
+	23
+	224
+	36
+	256
+	49
+	428
+	11
+	108
+	24
+	134
+	37
+	288
+	50
+	460
+	12
+	20
+	25
+	166
+	38
+	320
+	51
+	492
+	Table 2.2.5: BfuAmountTab Values
+This table defines the total number of BFUs that can be active in a frame, allowing for variable data rates or quality levels. The index into this table is signaled using BitsPerBfuAmountTabIdx (3 bits).
+Index
+	Total BFUs
+	0
+	20
+	1
+	28
+	2
+	32
+	3
+	36
+	4
+	40
+	5
+	44
+	6
+	48
+	7
+	52
+	2.3. Scale Table
+The ScaleTable is a fundamental lookup for quantization and dequantization, providing the necessary amplitude scaling for spectral coefficients. Its precise values are critical for maintaining the correct amplitude of the audio signal. The table is a 64-entry floating-point array used for dynamic range control. It is initialized once in the TAtrac1Data constructor using a power-of-2 formula, which allows for a wide dynamic range with a compact index.
+Formula: ScaleTable[i] = pow(2.0, (i / 3.0 - 21.0)) for i from 0 to 63.
+Table 2.3: ScaleTable Values
+Index (i)
+	Value (Scientific Notation)
+	Index (i)
+	Value (Scientific Notation)
+	Index (i)
+	Value (Scientific Notation)
+	Index (i)
+	Value (Scientific Notation)
+	0
+	1.8626451500e-07
+	16
+	7.5934509000e-06
+	32
+	3.1062839000e-04
+	48
+	1.2700000000e-02
+	1
+	2.3468508900e-07
+	17
+	9.5701890000e-06
+	33
+	3.9169608000e-04
+	49
+	1.6000000000e-02
+	2
+	2.9585695000e-07
+	18
+	1.2067425000e-05
+	34
+	4.9406565000e-04
+	50
+	2.0200000000e-02
+	3
+	3.7297063000e-07
+	19
+	1.5217495000e-05
+	35
+	6.2312670000e-04
+	51
+	2.5500000000e-02
+	4
+	4.7029853000e-07
+	20
+	1.9207554000e-05
+	36
+	7.8599426000e-04
+	52
+	3.2100000000e-02
+	5
+	5.9288417000e-07
+	21
+	2.4229986000e-05
+	37
+	9.9123840000e-04
+	53
+	4.0500000000e-02
+	6
+	7.4764953000e-07
+	22
+	3.0558156000e-05
+	38
+	1.2499696000e-03
+	54
+	5.1100000000e-02
+	7
+	9.4299499000e-07
+	23
+	3.8544970000e-05
+	39
+	1.5765792000e-03
+	55
+	6.4400000000e-02
+	8
+	1.1887764000e-06
+	24
+	4.8596637000e-05
+	40
+	1.9877873000e-03
+	56
+	8.1200000000e-02
+	9
+	1.4986289000e-06
+	25
+	6.1264420000e-05
+	41
+	2.5065099000e-03
+	57
+	1.0200000000e-01
+	10
+	1.8893902000e-06
+	26
+	7.7289870000e-05
+	42
+	3.1612278000e-03
+	58
+	1.2900000000e-01
+	11
+	2.3813959000e-06
+	27
+	9.7483640000e-05
+	43
+	3.9863711000e-03
+	59
+	1.6300000000e-01
+	12
+	3.0029589000e-06
+	28
+	1.2292723000e-04
+	44
+	5.0287515000e-03
+	60
+	2.0500000000e-01
+	13
+	3.7858488000e-06
+	29
+	1.5492476000e-04
+	45
+	6.3400000000e-03
+	61
+	2.5900000000e-01
+	14
+	4.7733568000e-06
+	30
+	1.9535350000e-04
+	46
+	7.9936067000e-03
+	62
+	3.2700000000e-01
+	15
+	6.0201389000e-06
+	31
+	2.4633729000e-04
+	47
+	1.0080000000e-02
+	63
+	4.1200000000e-01
+	2.4. Fixed Bit Allocation Tables
+These tables provide baseline bit allocations for BFUs, which are then dynamically adjusted by the psychoacoustic model. Their exact values dictate the default bit distribution across frequency bands, which is then refined by the psychoacoustic model. Without these tables, the bit allocation would be incorrect, leading to non-compliant bitstreams and potentially poor audio quality.
+Table 2.4.1: FixedBitAllocTableLong Values
+This array provides fixed bit allocation values for each BFU when operating in "long" block mode, generally prioritizing lower frequencies.
+BFU Index (0-51)
+	Bits Allocated
+	BFU Index (0-51)
+	Bits Allocated
+	BFU Index (0-51)
+	Bits Allocated
+	0-2
+	7
+	19-21
+	6
+	36-38
+	4
+	3-18
+	6
+	22-34
+	5
+	39-44
+	3
+	
+
+	
+
+	35
+	4
+	45-48
+	1
+	
+
+	
+
+	
+
+	
+
+	49-51
+	0
+	Table 2.4.2: FixedBitAllocTableShort Values
+This array provides fixed bit allocation values for each BFU when operating in "short" block mode.
+BFU Index (0-51)
+	Bits Allocated
+	BFU Index (0-51)
+	Bits Allocated
+	BFU Index (0-51)
+	Bits Allocated
+	0-23
+	6
+	24-35
+	5
+	36-43
+	4
+	
+
+	
+
+	
+
+	
+
+	44-51
+	0
+	Table 2.4.3: BitBoostMask Values
+This binary mask indicates which BFUs are eligible for dynamic bit boosting, revealing the codec's preference for boosting bits in specific frequency regions where additional bits yield higher quality gains. A value of 1 indicates eligibility for boosting, 0 indicates no eligibility.
+BFU Index (0-51)
+	Mask Value
+	BFU Index (0-51)
+	Mask Value
+	BFU Index (0-51)
+	Mask Value
+	0-17
+	0
+	24-31
+	0
+	39-51
+	0
+	18-22
+	1
+	32-35
+	1
+	
+
+	
+
+	23
+	0
+	36-38
+	1
+	
+
+	
+
+	2.5. QMF and MDCT Coefficients
+These coefficients define the fundamental transformations (QMF and MDCT) within the codec. Their exact values are paramount for numerical stability and the perfect reconstruction properties of the filter banks and transforms. Any deviation would lead to severe audible artifacts.
+Table 2.5.1: TapHalf Values
+These 24 coefficients serve as the base for constructing the 48-tap QMF filter.
+Index
+	Value
+	Index
+	Value
+	0
+	-1.461907e-05
+	12
+	-6.1169922e-05
+	1
+	-9.205479e-05
+	13
+	-1.344162e-02
+	2
+	-5.6157569e-05
+	14
+	2.4626821e-03
+	3
+	3.0117269e-04
+	15
+	2.1736089e-02
+	4
+	2.422519e-04
+	16
+	-7.801671e-03
+	5
+	-8.5293897e-04
+	17
+	-3.4090221e-02
+	6
+	-5.205574e-04
+	18
+	1.880949e-02
+	7
+	2.0340169e-03
+	19
+	5.4326009e-02
+	8
+	7.8333891e-04
+	20
+	-4.3596379e-02
+	9
+	-4.2153862e-03
+	21
+	-9.9384367e-02
+	10
+	-7.5614988e-04
+	22
+	1.3207909e-01
+	11
+	7.8402944e-03
+	23
+	4.6424159e-01
+	Table 2.5.2: QmfWindow Derivation and Values
+The QmfWindow is a 48-tap symmetric FIR filter derived from TapHalf for QMF analysis and synthesis.
+Derivation: QmfWindow[i] = TapHalf[i] * 2.0 and QmfWindow[sz - 1 - i] = TapHalf[i] * 2.0 for i from 0 to 23, where sz is 48. This symmetric derivation is key for the filter's properties.
+Table 2.5.3: SineWindow Values and Formula
+The SineWindow is a 32-entry floating-point array used in MDCT operations to ensure Time-Domain Aliasing Cancellation (TDAC) for seamless reconstruction across overlapping MDCT blocks.
+Formula: SineWindow[i] = sin((i + 0.5) * (M_PI / (2.0 * 32.0))) for i from 0 to 31.
+Index (i)
+	Value
+	Index (i)
+	Value
+	Index (i)
+	Value
+	Index (i)
+	Value
+	0
+	0.0490676743
+	8
+	0.4280790890
+	16
+	0.7469213197
+	24
+	0.9634057813
+	1
+	0.0980171403
+	9
+	0.4721919106
+	17
+	0.7803333333
+	25
+	0.9816000000
+	2
+	0.1467304190
+	10
+	0.5152579220
+	18
+	0.8120610931
+	26
+	0.9976644083
+	3
+	0.1951016769
+	11
+	0.5571891969
+	19
+	0.8420350474
+	27
+	1.0000000000
+	4
+	0.2430222046
+	12
+	0.5979007421
+	20
+	0.8701886121
+	28
+	0.9976644083
+	5
+	0.2903823438
+	13
+	0.6373093952
+	21
+	0.8964593456
+	29
+	0.9816000000
+	6
+	0.3370783103
+	14
+	0.6753340502
+	22
+	0.9207886987
+	30
+	0.9634057813
+	7
+	0.3830097966
+	15
+	0.7118968032
+	23
+	0.9431215433
+	31
+	0.9431215433
+	2.6. Transient Detection Coefficients
+These coefficients define the High-Pass Filter used to emphasize transient components for detection. Their precision is important for accurately identifying transients, which in turn drives the adaptive windowing.
+Table 2.6.1: HPF FIR Coefficients Values
+This array contains 10 floating-point coefficients for the High-Pass Filter.
+Index
+	Value
+	0
+	-8.65163e-18 * 2.0
+	1
+	-0.00851586 * 2.0
+	2
+	-6.74764e-18 * 2.0
+	3
+	0.0209036 * 2.0
+	4
+	-3.36639e-17 * 2.0
+	5
+	-0.0438162 * 2.0
+	6
+	-1.54175e-17 * 2.0
+	7
+	0.0931738 * 2.0
+	8
+	-5.52212e-17 * 2.0
+	9
+	-0.313819 * 2.0
+	Filter Parameters:
+* FIRLen: 21 (filter length).
+* PrevBufSz: 20 (previous buffer size for overlap).
+2.7. Psychoacoustic Model Constants
+These constants and formulas are fundamental to the perceptual coding aspect of ATRAC1. They allow the codec to determine which audio information is audible and to what extent, directly influencing where bits are allocated for optimal perceived quality.
+Table 2.7.1: ATH Lookup Table Values
+This 96-entry array provides base values for the Absolute Threshold of Hearing (tab) for frequencies ranging from 10 Hz to 25,118.9 Hz. The values are in millibel relative to 20 µPa.
+Frequency (Hz)
+	Values (millibel)
+	Frequency (Hz)
+	Values (millibel)
+	Frequency (Hz)
+	Values (millibel)
+	10.0
+	9669, 9669, 9626, 9512
+	199.5
+	1430, 1341, 1260, 1198
+	2511.9
+	-295, -350, -401, -421
+	12.6
+	9353, 9113, 8882, 8676
+	251.2
+	1136, 1057, 998, 943
+	3162.3
+	-446, -499, -532, -535
+	15.8
+	8469, 8243, 7997, 7748
+	316.2
+	887, 846, 744, 712
+	3981.1
+	-513, -476, -431, -313
+	20.0
+	7492, 7239, 7000, 6762
+	398.1
+	693, 668, 637, 606
+	5011.9
+	-179, 8, 203, 403
+	25.1
+	6529, 6302, 6084, 5900
+	501.2
+	580, 555, 529, 502
+	6309.6
+	580, 736, 881, 1022
+	31.6
+	5717, 5534, 5351, 5167
+	631.0
+	475, 448, 422, 398
+	7943.3
+	1154, 1251, 1348, 1421
+	39.8
+	5004, 4812, 4638, 4466
+	794.3
+	375, 351, 327, 322
+	10000.0
+	1479, 1399, 1285, 1193
+	50.1
+	4310, 4173, 4050, 3922
+	1000.0
+	312, 301, 291, 268
+	12589.3
+	1287, 1519, 1914, 2369
+	63.1
+	3723, 3577, 3451, 3281
+	1258.9
+	246, 215, 182, 146
+	15848.9
+	3352, 4352, 5352, 6352
+	79.4
+	3132, 3036, 2902, 2760
+	1584.9
+	107, 61, 13, -35
+	19952.6
+	7352, 8352, 9352, 9999
+	100.0
+	2658, 2591, 2441, 2301
+	1995.3
+	-96, -156, -179, -235
+	25118.9
+	9999, 9999, 9999, 9999
+	125.9
+	2212, 2125, 2018, 1900
+	
+
+	
+
+	
+
+	
+
+	158.5
+	1770, 1682, 1594, 1512
+	
+
+	
+
+	
+
+	
+
+	Table 2.7.2: Loudness Curve Generation Formula
+The Loudness Curve is generated as a 512-entry array (NumSamples). It models the human ear's non-linear sensitivity to loudness across frequencies.
+* Generation Formula:
+   1. Map spectral index i to frequency f: f = (i + 3) * 0.5 * 44100 / sz
+   2. Compute intermediate loudness t (logarithmic scale): t = std::log10(f) - 3.5
+   3. Adjust t with parabolic and linear terms: t = -10 * t * t + 3 - f / 3000
+   4. Convert t to linear scale: t = std::pow(10, (0.1 * t))
+3. Core Algorithms and Mathematical Models
+This section delves into the detailed algorithms that underpin ATRAC1's compression and decompression, explaining their purpose and implementation specifics.
+3.1. Sub-band Coding (QMF Analysis and Synthesis)
+Sub-band coding in ATRAC1 serves to divide the 512-sample PCM input into three frequency bands (Low, Mid, High) for tailored compression during analysis, and to reconstruct PCM from these bands during synthesis.
+Implementation (Analysis):
+The analysis process is implemented by Atrac1AnalysisFilterBank , which internally utilizes the TQmf<TPCM, nIn> template class. A two-stage QMF bank is employed:
+* Stage 1 (Qmf1): Splits the 512 input samples into a mid-low band (256 samples) and a high band (256 samples).
+* Stage 2 (Qmf2): Further splits the mid-low band into a low band (128 samples) and a mid band (128 samples). The TQmf::Analysis method manages an internal PcmBuffer by shifting old samples (memcpy(&PcmBuffer, &PcmBuffer[nIn + i], sizeof(TPCM) * 46);) and then copying new input samples into it. The core filtering involves applying the 48-tap symmetric FIR filter (QmfWindow) through a convolution-like sum. A butterfly operation then transforms these intermediate sums into the final lower and upper band components. Delay compensation, specified by delayComp = 39 , is managed by Atrac1AnalysisFilterBank using a DelayBuf (memcpy(&DelayBuf, &DelayBuf, sizeof(float) * delayComp);) to ensure perfect reconstruction and proper alignment of samples across stages. All QMF buffers (PcmBuffer, PcmBufferMerge, DelayBuf) are zero-initialized in the TQmf constructor.
+Implementation (Synthesis):
+The synthesis process combines the Low, Mid, and High bands to reconstruct the full PCM signal, handled by Atrac1SynthesisFilterBank , which also uses TQmf. The Atrac1SynthesisFilterBank::Synthesis function begins by managing the DelayBuf for the high band, shifting existing data and incorporating the new high-band samples (memcpy(&DelayBuf, &DelayBuf, sizeof(float) * delayComp); memcpy(&DelayBuf[delayComp], hi, sizeof(float) * 256);). Qmf2.Synthesis then combines the low and mid bands into a MidLowTmp buffer using an inverse butterfly operation. Subsequently, Qmf1.Synthesis combines MidLowTmp and the DelayBuf (which now contains the high band and shifted delayed data) to produce the final pcm output. The TQmf::Synthesis method copies DelayBuff to PcmBufferMerge, performs inverse butterfly operations on the merged lower and upper bands, and then convolves the result with QmfWindow to reconstruct the PCM. For continuity, the last 46 samples of PcmBufferMerge are copied back into DelayBuff for the next synthesis operation.
+3.2. Modified Discrete Cosine Transform (MDCT) and Inverse MDCT (IMDCT)
+The MDCT converts time-domain signals to frequency-domain coefficients for quantization, while the IMDCT reconstructs time-domain signals from these coefficients.
+Implementation (MDCT):
+The forward MDCT is handled by the TAtrac1MDCT::Mdct method. This method adaptively selects between long (256-point for Low/Mid bands, 512-point for High band) and short (multiple 64-point MDCTs) windows based on the blockSize.LogCount parameter, which is determined by transient detection. A SineWindow is applied to the input data to ensure Time-Domain Aliasing Cancellation (TDAC), a critical property for perfect reconstruction in overlapping transforms. This involves specific memcpy and multiplication operations within Mdct to prepare a temporary buffer (tmp) for the transform. The actual MDCT calculation is performed by calling specialized internal MDCT objects (Mdct512, Mdct256, or Mdct64) based on the chosen window size. For the mid and high bands, the spectral coefficients undergo a reordering process using the SwapArray function. Additionally, high band coefficients processed with short windows receive a level compensation by being multiplied by 2.0.
+Implementation (IMDCT):
+The inverse MDCT is handled by the TAtrac1MDCT::IMdct method. Similar to the MDCT, the mode.LogCount parameter dictates the correct IMDCT size (64, 256, or 512 points). For the mid and high bands, the SwapArray function is invoked again to reverse the coefficient permutation applied during encoding, ensuring the correct order for reconstruction. The IMDCT calculation is performed by calling specialized internal IMDCT objects (Midct64, Midct256, or Midct512). Crucially, overlap-add synthesis is performed using the vector_fmul_window function in conjunction with TAtrac1Data::SineWindow. This function combines data from a previous buffer (prevBuf) with the current inverse MDCT output (invBuf) using windowing, producing the reconstructed time-domain data for the destination buffer (dstBuf). The len parameter in vector_fmul_window is 16, indicating a 16-sample overlap region. Final memcpy operations handle the non-overlapping central parts of long windows and prepare dstBuf for the next frame's overlap, ensuring a seamless and artifact-free reconstruction.
+The use of the SwapArray function in both TAtrac1MDCT::Mdct and TAtrac1MDCT::IMdct for the mid and high bands represents a specific implementation detail. This function is a generic array reversal utility. Its application implies that after the MDCT for these bands, the spectral coefficients are reversed, and this reversal must be precisely undone during IMDCT. The underlying rationale for this particular reordering or permutation logic is not explicitly documented in the source code. For a compliant implementation, this exact reversal must be meticulously replicated. This design choice may stem from specific hardware optimization requirements, cache efficiency considerations, or a particular phase relationship necessary for these frequency bands that is not immediately apparent from standard MDCT theory. Incorrect implementation or omission of this step would lead to severe audio corruption in the mid and high frequencies.
+3.3. Psychoacoustic Model
+The psychoacoustic model is integral to ATRAC1's perceptual coding, guiding bit allocation by identifying inaudible components and weighting perceptible ones, thereby mimicking human hearing.
+Absolute Threshold of Hearing (ATH):
+The ATH is calculated by the ATHformula_Frank function. This function takes a frequency (clamped between 10 Hz and 29,853 Hz) as input. It computes a logarithmic frequency (freq_log = 40.0 * log10(0.1 * freq)) and then interpolates between values from a 96-entry lookup table (tab). The interpolated value, initially in millibel, is converted to decibels (factor 0.01). An additional frequency-squared dependent adjustment (trh -= f * f * 0.015;) is applied. The output is the ATH in decibels, calculated for 512 spectral lines at a 44.1 kHz sample rate.
+Loudness Curve:
+The CreateLoudnessCurve function generates a loudness curve of size 512 (NumSamples). This curve models the human ear's non-linear sensitivity to loudness across frequencies. The algorithm maps each spectral index i to a corresponding frequency (f = (i + 3) * 0.5 * 44100 / sz). An intermediate loudness value t is computed using a parabolic adjustment (t = log10(f) - 3.5; t = -10 * t * t + 3 - f / 3000;), and this value is then converted to a linear scale (t = pow(10, 0.1 * t)).
+Spectral Spread:
+The AnalizeScaleFactorSpread function analyzes the standard deviation of ScaleFactorIndex values across scaledBlocks. The standard deviation (sigma) is normalized by clamping it at 14.0 and then dividing by 14.0. The output is a value between 0.0 and 1.0, indicating whether the signal is more tone-like (low spread) or noise-like (high spread). This value influences how bits are allocated, allowing the algorithm to adapt to the signal's characteristics.
+Loudness Tracking:
+The TrackLoudness functions provide a mechanism to smooth the loudness estimate across frames, preventing abrupt changes in perceived quality. Two recursive formulas are used: loudness = 0.98 * prevLoud + 0.01 * (l0 + l1) for stereo audio, and loudness = 0.98 * prevLoud + 0.02 * l for mono audio.
+A notable aspect of the loudness tracking mechanism is its adaptive behavior based on transient detection. The recursive smoothing applied by the TrackLoudness function is conditionally bypassed. Specifically, for stereo audio, smoothing is active only if both channels indicate no transients (windowMasks == 0 && windowMasks == 0). For mono, smoothing is active only if no transient is detected in the single channel (windowMasks == 0). This design choice reflects a sophisticated psychoacoustic optimization. For stationary audio, a smoothed loudness estimate is appropriate, leading to stable bit allocation and consistent quality. However, when transients occur, the codec must react immediately to the sudden energy change to prevent pre-echo, an audible artifact where quantization noise precedes a sharp attack. By bypassing smoothing during transient events, the bit allocation algorithm can respond directly and rapidly to the instantaneous energy profile of the signal. This adaptive behavior is crucial for maintaining high perceived audio quality across diverse audio content, particularly when handling percussive sounds or sudden, sharp attacks, demonstrating an intelligent switch in loudness estimation strategy based on the signal's characteristics.
+3.4. Transient Detection
+Transient detection identifies sudden amplitude changes in the audio signal to trigger short MDCT windows, which is essential for reducing pre-echo.
+High-Pass Filter (HPF):
+The transient detection process begins with a High-Pass Filter (HPF) applied to the audio data. The HPF uses a set of 10 FIR coefficients. The filter's length is defined by FIRLen = 21 , and it utilizes a PrevBufSz = 20 for previous buffer overlap. The TTransientDetector::HPFilter algorithm implements a symmetric FIR filter. It sums products of coefficients and input samples, then normalizes the result by dividing by 2. The function manages an internal HPFBuffer for sample history using memcpy operations to ensure continuity across processing blocks.
+RMS Analysis:
+Following the HPF, an RMS analysis is performed by the TTransientDetector::Detect function. This function calculates the RMS energy per short block from the high-pass filtered data. It then compares the RMS energy of consecutive blocks against specific thresholds: a transient is detected if there is a +16 dB increase or a -20 dB decrease in RMS energy between blocks. The output of this process is a 3-bit windowMask (e.g., EWM_AUTO, EWM_NOTRANSIENT), which indicates which frequency bands contain detected transients. This windowMask directly informs the adaptive MDCT windowing stage.
+3.5. Bit Allocation
+Bit allocation is the process of assigning bits to Basic Frequency Units (BFUs) based on psychoacoustic criteria and the available bit budget, ensuring a fixed 212-byte frame size for the compressed output.
+Implementation:
+The core bit allocation calculation is performed by TAtrac1SimpleBitAlloc::CalcBitsAllocation. This function utilizes FixedBitAllocTableLong and FixedBitAllocTableShort to establish baseline bit allocations. It integrates the AnalizeScaleFactorSpread value and the loudness (which scales the ATHLong values ) to refine the bit allocation. A key psychoacoustic principle is applied here: if the maximum energy of a scaledBlock is below the calculated Auditory Threshold of Hearing (scaledBlocks[i].MaxEnergy < ath), its bit allocation is set to 0, effectively discarding inaudible components.
+The TAtrac1SimpleBitAlloc::Write method employs an iterative optimization process. It uses a nested iterative search to find an optimal shift value that fits the total bitsAvaliablePerBfus within a narrow target range (minBits to maxBits). This iterative approach is a common pattern in Constant Bit Rate (CBR) audio codecs. Since the output frame size (SoundUnitSize = 212 bytes) is fixed, the total number of bits available for spectral data is also fixed after accounting for header overhead. The CalcBitsAllocation function provides an initial estimate, but it is unlikely to perfectly match the exact bit budget. The inner loop systematically adjusts the shift parameter; a higher shift generally reduces allocated bits, while a lower shift increases them. By comparing the bitsUsed against minBits and maxBits (a narrow target range), the algorithm iteratively converges on a shift that results in a total bit count within the allowed budget. This dynamic process ensures the output bitstream adheres to the fixed frame size while attempting to maximize perceptual quality by intelligently distributing bits. This design choice implies a trade-off between computational complexity and strict bitrate adherence.
+Following this primary allocation, dynamic boosting is performed by TBitsBooster::ApplyBoost to distribute any surplus bits. The ApplyBoost function uses the BitBoostMask to determine which BFUs are eligible for additional bits, prioritizing those that need 2 bits (from a current allocation of 0 bits) over those that need 1 bit (from an existing allocation).
+3.6. Scaling and Quantization
+Scaling normalizes spectral coefficients, and quantization converts them into integer mantissas for efficient storage in the bitstream.
+Scaling:
+The TScaler::Scale function normalizes coefficients to a maximum absolute value of 1.0 using the ScaleTable. The algorithm first identifies the maxAbsSpec in the input block. It then uses ScaleIndex.lower_bound(maxAbsSpec) to determine the appropriate scaleFactor and its corresponding scaleFactorIndex. Input values are divided by this scaleFactor to produce scaledValues, which are then clamped to 0.99999 if their absolute value is greater than or equal to 1.0. The function also calculates the MaxEnergy for the block. The output is a TScaledBlock object, containing the scale factor index and the normalized scaled values.
+Quantization:
+The QuantMantisas function quantizes the scaled coefficients into integer mantissas, with the objective of minimizing energy loss. The function converts scaledValue * mul to integer mantisas using ToInt (which internally uses lrint for rounding). It features an optional ea (energy adjustment) flag. When ea is true, the function identifies "candidates"—values that are numerically close to X.5 (e.g., 3.4, 3.6). These are points where rounding decisions have the largest impact on the final integer value and, consequently, on the energy of the quantized block. The algorithm then iteratively adjusts the rounding of these "candidates" (either up or down in magnitude) to bring the quantized energy (e2) as close as possible to the original energy (e1). This is a sophisticated micro-optimization for reducing quantization noise. By preserving the energy of spectral blocks as closely as possible, the codec can prevent audible artifacts that might arise from energy imbalances, contributing significantly to the perceived transparency of the compressed audio. This approach reflects a deep understanding of how quantization errors impact human perception.
+Bitstream Handling (Signed Values):
+The NBitStream::MakeSign function is used to correctly handle signed integer mantissas. During encoding, it ensures proper sign extension when writing values to the bitstream. During decoding, it reconstructs the signed values from the bitstream. The algorithm employs bit shifting (val << shift then v.s >> shift) and type punning (via a union) to accurately interpret signed values within a specified number of bits.
+4. ATRAC1 Encoder Pipeline
+The encoding pipeline transforms raw PCM audio into a compressed ATRAC1 bitstream, following a series of perceptually optimized stages.
+4.1. Input Segmentation and Channel De-interleaving
+The encoder, specifically through the TAtrac1Encoder::GetLambda method , receives PCM audio in fixed blocks of 512 samples per channel, as defined by TAtrac1Data::NumSamples. For multi-channel input, such as stereo, the interleaved samples are separated into distinct channel buffers (src[i] = data[i * srcChannels + channel];), preparing them for independent processing.
+4.2. QMF Analysis Stage
+The de-interleaved PCM data for each channel is then fed into a two-stage Quadrature Mirror Filter (QMF) bank, managed by AnalysisFilterBank[channel].Analysis. This process effectively splits the 512-sample input into three distinct frequency bands: a Low band (128 samples), a Mid band (128 samples), and a High band (256 samples). These band-limited signals are stored in PcmBufLow, PcmBufMid, and PcmBufHi respectively. The Atrac1AnalysisFilterBank meticulously manages internal delay buffers (MidLowTmp, DelayBuf) to ensure perfect reconstruction properties of the filter bank, maintaining signal integrity across processing stages.
+4.3. Transient Detection and Adaptive Windowing
+Transient detection is a conditional process, performed only if the encoding settings specify EWM_AUTO mode (Settings.GetWindowMode() == TAtrac1EncodeSettings::EWindowMode::EWM_AUTO). If this mode is not selected, a fixed WindowMask is applied instead. TTransientDetector instances, one assigned per channel per frequency band , analyze the PcmBufLow, PcmBufMid, and PcmBufHi data. The Detect() method of TTransientDetector employs an internal High-Pass Filter (HPFilter) and RMS analysis to identify sudden energy changes indicative of transients. The results of these detections are consolidated into a 3-bit windowMask (with one bit per band). This mask directly dictates whether a short or long MDCT window will be used for each band in the subsequent transformation stage (blockSz[channel] = TAtrac1Data::TBlockSizeMod(windowMask & 0x1, windowMask & 0x2, windowMask & 0x4);).
+4.4. MDCT Transformation
+The TAtrac1MDCT::Mdct method is applied to the outputs of the QMF analysis stage (PcmBufLow, PcmBufMid, PcmBufHi). The blockSz parameter, determined by the transient detection stage, governs whether 256-point (for Low/Mid) or 512-point (for High) long MDCTs are performed, or if multiple 64-point short MDCTs are used for transient sections. A SineWindow is applied to the input data to ensure Time-Domain Aliasing Cancellation (TDAC), which is critical for seamless reconstruction. For the mid and high bands, the resulting spectral coefficients undergo a reordering process using the SwapArray function. Additionally, high band coefficients processed with short windows receive a level compensation by being multiplied by 2.0. The transformed frequency-domain coefficients are then stored in the specs array ((*buf)[channel].Specs).
+4.5. Psychoacoustic Analysis
+For each channel's specs (spectral data), a series of psychoacoustic analyses are performed to inform the bit allocation process.
+* Loudness Calculation: The energy of the specs is weighted by the LoudnessCurve to compute (*buf)[channel].Loudness. This step accounts for the human ear's non-linear sensitivity across different frequencies.
+* Loudness Tracking: The overall Loudness for the encoder is updated using the TrackLoudness function. This function applies a smoothing filter to the loudness estimate. This smoothing is conditionally bypassed during transient events to allow the bit allocation to react immediately to sudden energy changes, preventing pre-echo artifacts.
+* Spectral Spread Analysis: AnalizeScaleFactorSpread is invoked on the scaledBlocks (after the scaling stage) to determine the tonal versus noise-like characteristics of the signal. This analysis provides a metric that influences how bits are distributed.
+4.6. Scaling and Quantization
+The TScaler object is responsible for scaling the specs data using its Scaler.ScaleFrame() method. The ScaleFrame method iterates through the Basic Frequency Units (BFUs), and for each BFU, the TScaler::Scale function determines an appropriate ScaleFactorIndex from the ScaleTable. It then normalizes the spectral coefficients to a range of [-0.99999, 0.99999]. The output of this stage is a vector of TScaledBlock objects, each containing the ScaleFactorIndex and the normalized Values. While the QuantMantisas function is not directly called within atrac1denc.cpp, its energy-aware quantization logic is implicitly applied when the Values are converted to integer mantissas and written to the bitstream, utilizing lrint for rounding and NBitStream::MakeSign for handling signed values.
+4.7. Bit Allocation
+The TAtrac1SimpleBitAlloc::Write method is invoked for each audio channel to determine and apply the bit allocation. This method iteratively calculates the bitsPerEachBlock for all BFUs, aiming to fit the data precisely within the fixed SoundUnitSize (212 bytes) of a compressed frame. The CalcBitsAllocation function uses the FixedBitAllocTableLong or FixedBitAllocTableShort as a baseline. It further refines the allocation by incorporating the AnalizeScaleFactorSpread value and the ATHLong values (which are adjusted by the current loudness estimate). A critical step is setting the bit allocation to 0 for any BFU whose maximum energy falls below the calculated Auditory Threshold of Hearing, ensuring that inaudible components do not consume bits. The process employs an iterative search to find an optimal shift value that ensures the total bitsUsed falls within the available bit budget (minBits to maxBits). This iterative approach is essential for maintaining the Constant Bit Rate (CBR) output. Finally, TBitsBooster::ApplyBoost distributes any remaining surplus bits to eligible BFUs, as identified by the BitBoostMask , prioritizing allocations that provide the most perceptual benefit.
+4.8. Bitstream Construction and Frame Packing
+The final stage involves the construction of the 212-byte compressed frame by TAtrac1BitStreamWriter::WriteBitStream , which utilizes the NBitStream::TBitStream class. This process involves writing the following elements in a specific order:
+* Control data, including a 2-bit BSM (Block Size Mode) per band and a 3-bit BFU amount index.
+* 4-bit word lengths (wordLens) for each BFU.
+* 6-bit scale factor indices (idScaleFactors) for each BFU.
+* The quantized spectral coefficients (mantissas), with NBitStream::MakeSign ensuring correct handling of signed values. The frame is then padded with zeros to precisely reach the 212-byte SoundUnitSize. The completed compressed frame is written to the AEA output file via Container->WriteFrame , which in turn invokes TAeaOutput::WriteFrame.
+5. ATRAC1 Decoder Pipeline
+The decoding pipeline reconstructs PCM audio from the compressed ATRAC1 bitstream, reversing the encoding process through a series of precise stages.
+5.1. Bitstream Parsing and Frame Extraction
+The decoding process is initiated by the TAtrac1Decoder::GetLambda method , which reads 212-byte compressed frames from the input source using Aea->ReadFrame(). A NBitStream::TBitStream object is then initialized with the raw frame data, enabling bit-level access. From this bitstream, essential control data is extracted, including the 2-bit BSM (Block Size Mode) per band, the 3-bit BFU (Basic Frequency Unit) amount (numBFUs), the 4-bit word lengths (wordLens) for each BFU, and the 6-bit scale factor indices (idScaleFactors).
+5.2. Dequantization
+The TAtrac1Dequantiser::Dequant function is responsible for reconstructing the floating-point spectral coefficients from the parsed bitstream data. It first reads the wordLens and idScaleFactors from the bitstream. For each BFU, the corresponding scaleFactor is retrieved from the ScaleTable. The quantized values are read from the bitstream using stream->Read(wordLen) and are then converted back into their correct signed integer representation using NBitStream::MakeSign. These signed integers are subsequently multiplied by the scaleFactor and maxQuant (calculated as 1.0 / (float)((1 << (wordLen - 1)) - 1)) to yield the reconstructed floating-point spectral coefficients. Any BFUs with a wordLen of 0 are explicitly set to zero coefficients using memset, indicating that no data was encoded for those frequency bands. The dequantized coefficients are stored in the specs array.
+5.3. Inverse MDCT (IMDCT) Transformation
+The TAtrac1MDCT::IMdct method is applied to the dequantized specs array to convert the frequency-domain coefficients back into time-domain samples. The mode object, which was parsed from the bitstream, dictates the correct IMDCT size (64, 256, or 512 points) for each band. For the mid and high bands, the SwapArray function is invoked to reverse the permutation applied during the encoding stage, ensuring proper reconstruction. Overlap-add synthesis is then performed using the vector_fmul_window function in conjunction with SineWindow. This process combines the output of the IMDCT with overlapping data from previous blocks to seamlessly reconstruct the time-domain samples for the Low, Mid, and High bands, which are stored in PcmBufLow, PcmBufMid, and PcmBufHi respectively.
+5.4. QMF Synthesis Stage
+The Atrac1SynthesisFilterBank[channel].Synthesis function combines the reconstructed time-domain samples from the Low, Mid, and High bands. This stage meticulously manages internal delay buffers (MidLowTmp, DelayBuf) to ensure perfect reconstruction and proper phase alignment. The culmination of this process is the output of the full-band PCM audio for the current channel into a temporary sum buffer.
+5.5. PCM Reconstruction and Output Interleaving
+In the final step, the samples residing in the sum buffer are subjected to clipping, ensuring their values remain within the acceptable PCM range of PcmValueMax (1) and PcmValueMin (-1). These clipped samples are then interleaved and written to the final output data buffer (data[i * srcChannels + channel] = sum[i];), preparing the audio for playback or further processing.
+6. AEA File Format Specification
+The AEA (AtracDEnc Audio) file format is a simple container for ATRAC1 compressed audio, characterized by a fixed-size metadata header followed by sequential fixed-size compressed frames.
+6.1. Metadata Header Structure
+The metadata header is a fixed-size block of 2048 bytes, defined by AeaMetaSize. Its creation is handled by TAeaOutput::CreateMeta , where the header is zero-initialized using memset before specific fields are populated. Validation of the header is performed by TAeaInput::ReadMeta , which throws a TAeaFormatError if validation fails.
+Table 6.1: AEA Metadata Header Layout
+Offset (Bytes)
+	Size (Bytes)
+	Description
+	Value/Type
+	Source
+	0-3
+	4
+	Magic Numbers
+	0x00 0x08 0x00 0x00 (fixed signature)
+	
+
+	4-19
+	16
+	Title
+	Null-terminated string (max 16 chars)
+	
+
+	260-263
+	4
+	Total Frames
+	uint32_t
+	
+
+	264
+	1
+	Channel Count
+	char (1 or 2, validated to be < 3)
+	
+
+	265-2047
+	1783
+	Reserved
+	Zero-initialized
+	
+
+	6.2. Compressed Audio Frames
+The structure of the compressed audio data within an AEA file begins with a unique "dummy frame" followed by sequential fixed-size frames containing the actual audio.
+Dummy Frame: Immediately following the 2048-byte metadata header, the very first 212-byte frame is zero-initialized and serves as a dummy frame. This behavior is explicitly implemented in TAeaOutput::CreateMeta , which writes this dummy frame. Concurrently, TAeaOutput::WriteFrame includes a FirstWrite flag; on its initial invocation, it sets FirstWrite = false and returns without writing any data, effectively allowing the pre-written dummy frame to occupy the position of the first encoder-generated frame. This design suggests that the ATRAC1 codec or the AEA container format may necessitate an initial "warm-up" frame that does not contain valid audio data. This placeholder frame likely facilitates filter bank initialization, MDCT overlap, or other internal state stabilization, ensuring that subsequent valid audio frames are correctly aligned and processed by the decoder. This is a critical detail for compliant encoder implementations to ensure decoders can correctly synchronize and process the audio stream from its effective start.
+Subsequent Frames: Following the dummy frame, the file consists of sequential 212-byte frames. Each of these frames represents 512 samples per channel. The fixed size of these frames is a defining characteristic of the ATRAC1 Constant Bit Rate (CBR) output.
+Frame Structure: Each 212-byte frame is a packed bitstream with a specific layout:
+* Control data, such as a 2-bit BSM (Block Size Mode) per band and a 3-bit BFU amount index.
+* Word lengths (4 bits per BFU), defining the quantization precision for each Basic Frequency Unit.
+* Scale factors (6 bits per BFU), used to restore the magnitude of the spectral coefficients.
+* Quantized spectral coefficients, which are the compressed audio data.
+* The frame is padded with zeros to ensure it reaches the precise 212-byte size.
+6.3. Total Samples Calculation
+The total number of samples in an AEA file is derived from the file size and specific codec parameters. The formula used for this calculation is:
+Total samples = (uint64_t)512 * ((file_size - AeaMetaSize) / SoundUnitSize / nChannels - 5).
+Where:
+* file_size: The total size of the AEA file in bytes.
+* AeaMetaSize: The fixed header size of 2048 bytes.
+* SoundUnitSize: The fixed size of each compressed frame (212 bytes).
+* nChannels: The number of audio channels (1 or 2).
+A notable aspect of this formula is the subtraction of the constant 5 from the calculated number of frames per channel. This constant is explicitly undocumented in the source code comments. The presence of this fixed offset suggests that it accounts for more than just the single "dummy frame" explicitly written after the header. It is plausible that this value encompasses the dummy frame plus additional "warm-up" or padding frames. Audio codecs, particularly those employing filter banks (QMF, MDCT) with overlapping windows and delay buffers (delayComp=39 ), often require a few initial frames to fill their internal state before producing valid, perfectly reconstructed audio. The QMF analysis and synthesis involve DelayBuf and PcmBuffer management, and MDCT also utilizes overlap buffers. Therefore, the -5 likely accounts for the 1 dummy frame and 4 additional frames consumed by the codec's internal processing (e.g., filter bank delays, MDCT window overlaps) before the output becomes fully valid. This is a common practice in hardware-oriented codecs to ensure seamless playback from the very first "audible" sample. This constant is a critical detail for correctly determining the audio duration, and its fixed nature implies a consistent, hard-coded aspect of the ATRAC1 processing chain or AEA file structure. For a compliant implementation, this value must be replicated exactly, even if the precise internal reason for each of the 5 frames is not fully documented.
+7. Implementation Considerations and Undocumented Aspects
+This section highlights crucial aspects for developers implementing ATRAC1 from scratch, including error handling, component interdependencies, initialization states, and elements that require careful replication despite lacking explicit documentation.
+7.1. Error Handling and Critical Failures
+The ATRAC1 implementation employs a "fail-fast" strategy, using abort() for severe internal inconsistencies or corrupted bitstream states. This approach is common in low-level systems or embedded programming where resource constraints or the severity of internal errors (e.g., bitstream corruption) make graceful recovery impractical or risky. For an implementation from scratch, this means that any deviation from the expected bitstream format, internal data consistency, or buffer boundaries will lead to immediate program termination.
+* Custom Exceptions:
+   * TAeaIOError: This exception is thrown for I/O errors during file reading or writing (e.g., "Can't open file to read/write", "Can't read/write AEA header/frame"). It carries a descriptive text message and the system errno.
+   * TAeaFormatError: This is a marker exception used for invalid file formats (e.g., incorrect magic numbers or channel count in the AEA header). It signals a structural format mismatch.
+* Critical Failures (abort() calls): The codec uses abort() in several critical contexts :
+   * In src/atrac/atrac1_bitalloc.cpp, abort() is triggered if bfuAmountIdx is out of range, if there is a wordlen mismatch during bitstream writing, or if bitUsed exceeds SoundUnitSize * 8 (indicating bitstream corruption).
+   * In src/lib/bitstream/bitstream.cpp, abort() is called if the number of bits (n) is invalid (e.g., > 23 or < 0) during Write or Read operations.
+   * In src/pcmengin.h, std::abort() is invoked if TPCMBuffer access is out of bounds.
+This design choice prioritizes system stability and data integrity over graceful recovery in the face of severe errors. It suggests that the original ATRAC1 implementation was designed with a high degree of trust in the input data's compliance or was intended for environments where such failures are unrecoverable and immediate termination is the safest course of action. Developers must implement robust validation checks to prevent these conditions leading to abort().
+7.2. Interdependencies of Codec Components
+The ATRAC1 codec's components are highly interconnected, where the output of one stage directly influences the behavior of subsequent stages.
+* Transient detection influences MDCT windowing: The windowMask generated by TTransientDetector::Detect directly determines the TBlockSizeMod , which in turn dictates the MDCT window length used by TAtrac1MDCT::Mdct.
+* Psychoacoustic model refines bit allocation: The Absolute Threshold of Hearing (ATH) calculated by ATHformula_Frank and the AnalizeScaleFactorSpread value directly influence TAtrac1SimpleBitAlloc::CalcBitsAllocation. Additionally, Loudness tracking provides a smoothed input to the bit allocation algorithm.
+* Scaling precedes bit allocation: The TScaler::ScaleFrame function generates TScaledBlocks, which serve as essential inputs for TAtrac1SimpleBitAlloc::Write.
+7.3. Buffer and State Initialization
+Accurate initialization of buffers and state variables is critical for reproducible results and avoiding artifacts in the reconstructed audio.
+* Loudness: The Loudness variable in TAtrac1Encoder is initialized to LoudFactor = 0.006.
+* QMF Buffers: PcmBuffer and PcmBufferMerge are explicitly zero-initialized in the TQmf constructor. MidLowTmp and DelayBuf are resized (and thus zero-initialized for std::vector<float>) in the constructors of Atrac1AnalysisFilterBank and Atrac1SynthesisFilterBank.
+* MDCT Overlap Buffers: PcmBufLow, PcmBufMid, and PcmBufHi are declared as fixed-size arrays in TAtrac1Encoder and TAtrac1Decoder. While their constructors do not explicitly zero-initialize these arrays, their content is managed by memcpy and vector_fmul_window during MDCT/IMDCT operations. For a clean and predictable start in a new implementation, explicit zeroing of these buffers is recommended.
+* Transient Detector Buffers: The HPFBuffer is resized (and zero-initialized) in the TTransientDetector constructor. The LastEnergy variable is initialized to 0.0.
+* Scaler: The TScaler constructor populates its ScaleIndex map from the ScaleTable.
+* TAtrac1Data: Its constructor ensures the one-time initialization of the ScaleTable and SineWindow arrays.
+* TAtrac1SimpleBitAlloc: Its constructor pre-calculates and populates the static ATHLong vector, which stores pre-computed Absolute Threshold of Hearing values for each BFU.
+* TAtrac1MDCT: Its constructor initializes internal MDCT/IMDCT transform objects for various block sizes.
+* TAtrac1Encoder / TAtrac1Decoder: Their constructors handle the ownership transfer of I/O pointers and initialize the LoudnessCurve.
+7.4. Undocumented Elements
+Two specific elements within the ATRAC1 implementation are critical for compliance but lack explicit documentation regarding their precise rationale.
+* -5 Constant in Sample Calculation: As detailed in Section 6.3, the -5 constant used in TAeaInput::GetLengthInSamples is undocumented. This constant is crucial for correctly determining the total sample count in an AEA file. Its fixed nature suggests it accounts for a combination of the dummy frame and additional warm-up or padding frames required by the codec's internal processing (e.g., filter bank delays, MDCT window overlaps) before valid audio output commences.
+* SwapArray Permutation Logic: The SwapArray function is applied to reverse spectral coefficients for the mid and high bands during both MDCT and IMDCT operations. The exact reason for this specific reordering is not documented in the source code. Despite the lack of explicit explanation, this permutation must be replicated precisely in any new implementation to ensure compatibility and correct audio reconstruction.
+7.5. Recommendations for a Compliant Implementation
+To achieve a fully compliant and functional ATRAC1 encoder and decoder from scratch, the following recommendations are paramount:
+* Replicate all constants and tables exactly: This includes numerical values for SineWindow, ScaleTable, FixedBitAllocTableLong/Short, BitBoostMask, ATH Lookup Table, and all QMF and HPF filter coefficients. Any deviation in these values will lead to non-compliant bitstreams or audible artifacts.
+* Adhere to bitstream structure and order: The precise bit-level packing and unpacking of frames, including control data, word lengths, scale factors, and quantized coefficients, is critical for interoperability with existing ATRAC1 implementations.
+* Implement QMF and MDCT transforms accurately: This encompasses correct application of windowing functions, precise overlap-add mechanisms, and meticulous management of delay compensation in the filter banks.
+* Ensure robust error handling: Implement custom exceptions for specific error conditions (e.g., TAeaIOError, TAeaFormatError). While the original code employs a "fail-fast" strategy with abort() calls for critical internal inconsistencies, a user-facing application may benefit from replacing these with more graceful error reporting mechanisms, albeit while maintaining strict validation.
+* Investigate undocumented elements: Although this report provides an analysis of the -5 constant and SwapArray permutation, further dedicated testing or reverse-engineering efforts may yield a deeper understanding of their precise internal rationale, which could be beneficial for long-term maintenance or optimization.
+* Pay attention to floating-point precision: The pervasive use of float throughout the codec implies that floating-point arithmetic precision can significantly impact results. Developers should ensure consistent floating-point environment settings (e.g., rounding mode, as hinted by NEnv::SetRoundFloat() in src/env.cpp) to minimize discrepancies and ensure reproducible outputs.
+9. Conclusion
+This specification provides a comprehensive, self-contained guide to implementing the ATRAC1 codec. By meticulously replicating the constants, algorithms, and AEA file structure described, developers can create a fully compliant encoder and decoder. Special attention to undocumented elements, such as the SwapArray function and the -5 constant in sample calculation, is crucial for ensuring compatibility with existing ATRAC1 implementations. The codec’s design, optimized for hardware simplicity and perceptual efficiency, makes it a complex but achievable target for software implementation. The iterative bit allocation, adaptive loudness tracking, and energy-aware quantization highlight the sophisticated engineering choices made to deliver high audio quality within a constant bitrate, demonstrating a deep understanding of psychoacoustics and digital signal processing principles.
