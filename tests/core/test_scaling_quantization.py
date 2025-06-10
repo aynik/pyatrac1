@@ -72,7 +72,7 @@ class TestTScaler:
         result = scaler.scale(spectral_coeffs)
 
         assert result.scale_factor_index == expected_scale_factor_index
-        assert result.max_energy == pytest.approx(0.4)
+        assert result.max_energy == pytest.approx(0.16)  # 0.4^2 = 0.16
         expected_scaled_values = [
             0.1 / expected_scale_factor,  # 0.1 / 0.5 = 0.2
             -0.4 / expected_scale_factor,  # -0.4 / 0.5 = -0.8
@@ -93,7 +93,7 @@ class TestTScaler:
 
         result = scaler.scale(spectral_coeffs)
         assert result.scale_factor_index == expected_scale_factor_index
-        assert result.max_energy == pytest.approx(0.05)
+        assert result.max_energy == pytest.approx(0.0025)  # 0.05^2 = 0.0025
         expected_scaled_values = [
             0.01 / expected_scale_factor,
             -0.05 / expected_scale_factor,
@@ -113,7 +113,7 @@ class TestTScaler:
 
         result = scaler.scale(spectral_coeffs)
         assert result.scale_factor_index == expected_scale_factor_index
-        assert result.max_energy == pytest.approx(3.0)
+        assert result.max_energy == pytest.approx(9.0)  # 3.0^2 = 9.0
 
         # Values will be clamped
         expected_scaled_values = [
@@ -154,7 +154,7 @@ class TestTScaler:
         spectral_coeffs_large = [100.0]
         result_large = scaler.scale(spectral_coeffs_large)
         assert result_large.values[0] == pytest.approx(0.99999)
-        assert result_large.max_energy == pytest.approx(100.0)
+        assert result_large.max_energy == pytest.approx(10000.0)  # 100.0^2 = 10000.0
         assert (
             result_large.scale_factor_index == len(codec_data_fixture.scale_table) - 1
         )
@@ -164,7 +164,7 @@ class TestTScaler:
         spectral_coeffs_large_neg = [-100.0]
         result_large_neg = scaler.scale(spectral_coeffs_large_neg)
         assert result_large_neg.values[0] == pytest.approx(-0.99999)
-        assert result_large_neg.max_energy == pytest.approx(100.0)  # max_abs_spec
+        assert result_large_neg.max_energy == pytest.approx(10000.0)  # 100.0^2 = 10000.0
         assert (
             result_large_neg.scale_factor_index
             == len(codec_data_fixture.scale_table) - 1
@@ -187,7 +187,7 @@ class TestTScaler:
 
         result = scaler.scale(spectral_coeffs)
         assert result.scale_factor_index == expected_idx
-        assert result.max_energy == pytest.approx(0.55)
+        assert result.max_energy == pytest.approx(0.3025)  # 0.55^2 = 0.3025
         expected_scaled_val = (
             0.55 / full_scale_table_codec_data.scale_table[expected_idx]
         )

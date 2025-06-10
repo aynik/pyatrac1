@@ -16,7 +16,7 @@ from pyatrac1.core.scaling_quantization import TScaler, quantize_mantissas, Scal
 from pyatrac1.core.bit_allocation_logic import Atrac1SimpleBitAlloc, BitsBooster
 
 from pyatrac1.common import constants
-from pyatrac1.tables.spectral_mapping import SPECS_START_LONG
+from pyatrac1.tables.spectral_mapping import SPECS_START_LONG, SPECS_START_SHORT
 
 
 class Atrac1Encoder:
@@ -55,12 +55,44 @@ class Atrac1Encoder:
         
         # Frame counter for logging
         self.frame_counter = 0
+        
+        # Track windowing initialization state
+        self.windowing_initialized = [False, False]  # Per channel
+        
+        # Persistent spectral coefficient buffer to match atracdenc's Specs array
+        # This buffer persists across frames and MDCT blocks to match atracdenc behavior
+        self.spectral_coeffs_buffer = [
+            np.zeros(constants.NUM_SAMPLES, dtype=np.float32),  # Channel 0
+            np.zeros(constants.NUM_SAMPLES, dtype=np.float32)   # Channel 1
+        ]
 
     def _get_representative_freq_for_bfu(
-        self, bfu_index: int, is_long_block: bool
+        self, bfu_index: int, is_long_block: bool, block_size_mode: BlockSizeMode = None
     ) -> float:
         """Calculates a representative frequency for a BFU."""
-        spec_idx_start = SPECS_START_LONG[bfu_index]
+        if block_size_mode is not None:
+            # Helper function to determine band from BFU index (matches atracdenc BfuToBand)
+            def bfu_to_band(bfu_idx: int) -> int:
+                if bfu_idx < 20:
+                    return 0  # low band
+                elif bfu_idx < 36:
+                    return 1  # mid band
+                else:
+                    return 2  # high band
+            
+            # Determine which band this BFU belongs to
+            band = bfu_to_band(bfu_index)
+            
+            # Use correct SPECS_START table based on block size mode for this band
+            if ((band == 0 and block_size_mode.low_band_short) or 
+                (band == 1 and block_size_mode.mid_band_short) or 
+                (band == 2 and block_size_mode.high_band_short)):
+                spec_idx_start = SPECS_START_SHORT[bfu_index]
+            else:
+                spec_idx_start = SPECS_START_LONG[bfu_index]
+        else:
+            # Fallback for backwards compatibility
+            spec_idx_start = SPECS_START_LONG[bfu_index]
 
         return spec_idx_start * (constants.SAMPLE_RATE / 2.0) / constants.NUM_SAMPLES
 
@@ -68,6 +100,11 @@ class Atrac1Encoder:
         self, channel_samples: np.ndarray, channel_idx: int, frame_idx: int = 0
     ) -> bytes:
         """Encodes a single channel of audio data."""
+        
+        # Initialize windowing state on first use (like atracdenc dummy frames)
+        if not self.windowing_initialized[channel_idx]:
+            self.mdct_processor.initialize_windowing_state(channel_idx)
+            self.windowing_initialized[channel_idx] = True
 
         pcm_input_list = channel_samples.tolist()
         
@@ -79,26 +116,26 @@ class Atrac1Encoder:
         qmf_bank = (
             self.qmf_filter_bank_ch0 if channel_idx == 0 else self.qmf_filter_bank_ch1
         )
-        pcm_buf_low, pcm_buf_mid, pcm_buf_hi = qmf_bank.analysis(pcm_input_list)
+        pcm_buf_low, pcm_buf_mid, pcm_buf_hi = qmf_bank.analysis(pcm_input_list, frame_idx)
         
-        # Log QMF analysis outputs
+        # Log QMF analysis outputs to match atracdenc format
         log_debug("QMF_OUTPUT", "samples", pcm_buf_low, 
                   channel=channel_idx, frame=frame_idx, band="LOW",
-                  algorithm="qmf_analysis", qmf_band="low")
+                  algorithm="qmf_analysis", qmf_band='"low"')
         log_debug("QMF_OUTPUT", "samples", pcm_buf_mid, 
                   channel=channel_idx, frame=frame_idx, band="MID",
-                  algorithm="qmf_analysis", qmf_band="mid")
+                  algorithm="qmf_analysis", qmf_band='"mid"')
         log_debug("QMF_OUTPUT", "samples", pcm_buf_hi, 
                   channel=channel_idx, frame=frame_idx, band="HIGH",
-                  algorithm="qmf_analysis", qmf_band="high")
+                  algorithm="qmf_analysis", qmf_band='"high"')
 
         td_low = self.transient_detectors[channel_idx]["low"]
         td_mid = self.transient_detectors[channel_idx]["mid"]
         td_high = self.transient_detectors[channel_idx]["high"]
 
-        transient_low = bool(td_low.detect(np.array(pcm_buf_low, dtype=np.float32)))
-        transient_mid = bool(td_mid.detect(np.array(pcm_buf_mid, dtype=np.float32)))
-        transient_high = bool(td_high.detect(np.array(pcm_buf_hi, dtype=np.float32)))
+        transient_low = bool(td_low.detect(np.array(pcm_buf_low, dtype=np.float32), frame_idx, "LOW"))
+        transient_mid = bool(td_mid.detect(np.array(pcm_buf_mid, dtype=np.float32), frame_idx, "MID"))
+        transient_high = bool(td_high.detect(np.array(pcm_buf_hi, dtype=np.float32), frame_idx, "HIGH"))
 
         # Log transient detection results
         log_debug("TRANSIENT_DETECT", "decision", [transient_low, transient_mid, transient_high], 
@@ -119,31 +156,29 @@ class Atrac1Encoder:
                   mid_mdct_size=block_size_mode.mid_mdct_size, 
                   high_mdct_size=block_size_mode.high_mdct_size)
 
-        # Prepare QMF buffers for atracdenc MDCT interface
-        # Ensure buffers have the correct size and padding
-        low_buf = np.zeros(256, dtype=np.float64)
-        mid_buf = np.zeros(256, dtype=np.float64) 
-        hi_buf = np.zeros(512, dtype=np.float64)
+        # Use persistent buffers from MDCT processor (like atracdenc)
+        # Copy QMF output into the main buffer area [0:band_size]
+        self.mdct_processor.pcm_buf_low[channel_idx][:len(pcm_buf_low)] = pcm_buf_low
+        self.mdct_processor.pcm_buf_mid[channel_idx][:len(pcm_buf_mid)] = pcm_buf_mid
+        self.mdct_processor.pcm_buf_hi[channel_idx][:len(pcm_buf_hi)] = pcm_buf_hi
         
-        # Copy QMF data into properly sized buffers
-        low_buf[:len(pcm_buf_low)] = pcm_buf_low
-        mid_buf[:len(pcm_buf_mid)] = pcm_buf_mid
-        hi_buf[:len(pcm_buf_hi)] = pcm_buf_hi
+        # Get references to persistent buffers for MDCT processing
+        low_buf = self.mdct_processor.pcm_buf_low[channel_idx]
+        mid_buf = self.mdct_processor.pcm_buf_mid[channel_idx]
+        hi_buf = self.mdct_processor.pcm_buf_hi[channel_idx]
         
-        # Create output spectral coefficients array
-        flat_spectrum_coeffs = np.zeros(constants.NUM_SAMPLES, dtype=np.float64)
+        # Use persistent spectral coefficients buffer to match atracdenc's Specs array behavior
+        # This maintains coefficients across MDCT blocks and frames like atracdenc
+        flat_spectrum_coeffs = self.spectral_coeffs_buffer[channel_idx]
         
         # Call atracdenc-compatible MDCT
         self.mdct_processor.mdct(flat_spectrum_coeffs, low_buf, mid_buf, hi_buf, 
                                 block_size_mode, channel_idx, frame_idx)
         
-        # Log combined spectral coefficients
+        # Log combined spectral coefficients to match atracdenc format
         log_debug("SPECTRAL_COMBINED", "coeffs", flat_spectrum_coeffs,
                   channel=channel_idx, frame=frame_idx,
-                  algorithm="spectrum_combination", total_coeffs=constants.NUM_SAMPLES,
-                  low_mdct_size=block_size_mode.low_mdct_size, 
-                  mid_mdct_size=block_size_mode.mid_mdct_size, 
-                  high_mdct_size=block_size_mode.high_mdct_size)
+                  algorithm="spectrum_combination")
 
         psy_model = (
             self.psychoacoustic_model_ch0
@@ -181,7 +216,7 @@ class Atrac1Encoder:
             or block_size_mode.high_band_short
         )
         for i in range(num_active_bfus):
-            freq_bfu = self._get_representative_freq_for_bfu(i, is_long_mode_for_ath)
+            freq_bfu = self._get_representative_freq_for_bfu(i, is_long_mode_for_ath, block_size_mode)
             ath_db = ath_formula_frank(freq_bfu)
             ath_linear_amplitude = 10 ** (ath_db / 20.0)
             effective_ath_threshold = ath_linear_amplitude
@@ -198,10 +233,29 @@ class Atrac1Encoder:
                   algorithm="ath_calculation", overall_loudness=overall_loudness,
                   num_active_bfus=num_active_bfus, is_long_mode=is_long_mode_for_ath)
 
+        # Helper function to determine band from BFU index (matches atracdenc BfuToBand)
+        def bfu_to_band(bfu_idx: int) -> int:
+            if bfu_idx < 20:
+                return 0  # low band
+            elif bfu_idx < 36:
+                return 1  # mid band
+            else:
+                return 2  # high band
+
         scaled_blocks_channel: List[ScaledBlock] = []
         for i in range(num_active_bfus):
             num_specs_in_bfu = self.codec_data.specs_per_block[i]
-            start_idx_in_flat_spectrum = SPECS_START_LONG[i]
+            
+            # Determine which band this BFU belongs to
+            band = bfu_to_band(i)
+            
+            # Use correct SPECS_START table based on block size mode for this band
+            if ((band == 0 and block_size_mode.low_band_short) or 
+                (band == 1 and block_size_mode.mid_band_short) or 
+                (band == 2 and block_size_mode.high_band_short)):
+                start_idx_in_flat_spectrum = SPECS_START_SHORT[i]
+            else:
+                start_idx_in_flat_spectrum = SPECS_START_LONG[i]
 
             bfu_spectral_data = flat_spectrum_coeffs[
                 start_idx_in_flat_spectrum : start_idx_in_flat_spectrum
@@ -287,9 +341,9 @@ class Atrac1Encoder:
                 quantized_mantissas_channel.append([0] * bfu_size)
 
         frame_data_channel = Atrac1FrameData()
-        frame_data_channel.bsm_low = 0 if transient_low else 2
-        frame_data_channel.bsm_mid = 0 if transient_mid else 2
-        frame_data_channel.bsm_high = 0 if transient_high else 3
+        frame_data_channel.bsm_low = 2 if transient_low else 0
+        frame_data_channel.bsm_mid = 2 if transient_mid else 0
+        frame_data_channel.bsm_high = 3 if transient_high else 0
 
         frame_data_channel.bfu_amount_idx = chosen_bfu_amount_idx
         frame_data_channel.num_active_bfus = num_active_bfus

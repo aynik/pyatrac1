@@ -5,6 +5,7 @@ Exact implementation matching atracdenc reference for audio quality.
 
 import numpy as np
 from pyatrac1.common.constants import NUM_SAMPLES
+from pyatrac1.common.debug_logger import debug_logger
 
 # atracdenc TapHalf coefficients (24 values, doubled to create 48-tap window)
 TAP_HALF = np.array([
@@ -56,17 +57,23 @@ class TQmf:
             upper += QMF_WINDOW[(2*i)+1] * pcm_buffer[48-1+j-(2*i)-1]
         return lower, upper
 
-    def analysis(self, input_data: list[float]) -> tuple[list[float], list[float]]:
+    def analysis(self, input_data: list[float], frame_num: int = 0, stage: str = "QMF1") -> tuple[list[float], list[float]]:
         """
         Exact implementation of atracdenc TQmf::Analysis.
         """
         input_array = np.array(input_data, dtype=np.float32)
         
+        # Log QMF input
+        debug_logger.log_stage("QMF_INPUT", "SAMPLES", input_array[:16], frame=frame_num, band=stage)
+        
         # atracdenc: for (size_t i = 0; i < 46; i++) PcmBuffer[i] = PcmBuffer[nIn + i];
+        old_buffer = self.pcm_buffer[:46].copy()
         self.pcm_buffer[:46] = self.pcm_buffer[self.n_input_samples:self.n_input_samples + 46]
+        debug_logger.log_stage("QMF_BUFFER_SHIFT", "OLD_TO_NEW", old_buffer[:8], frame=frame_num, band=stage)
         
         # atracdenc: for (size_t i = 0; i < nIn; i++) PcmBuffer[46+i] = in[i];
         self.pcm_buffer[46:46 + self.n_input_samples] = input_array
+        debug_logger.log_stage("QMF_BUFFER_FILLED", "TOTAL", self.pcm_buffer[:64], frame=frame_num, band=stage)
         
         # Prepare output arrays
         lower = np.zeros(self.n_input_samples // 2, dtype=np.float32)
@@ -76,6 +83,10 @@ class TQmf:
         for j in range(0, self.n_input_samples, 2):
             lower_val, upper_val = self._calculate_qmf_taps(self.pcm_buffer, j)
             
+            # Log raw tap calculations for first few samples
+            if j < 8:
+                debug_logger.log_stage("QMF_RAW_TAPS", f"J{j}", [lower_val, upper_val], frame=frame_num, band=stage)
+            
             # atracdenc butterfly:
             # temp = upper[j/2];
             # upper[j/2] = lower[j/2] - upper[j/2];
@@ -83,6 +94,15 @@ class TQmf:
             temp = upper_val
             upper[j//2] = lower_val - upper_val
             lower[j//2] = lower_val + temp
+            
+            # Log butterfly output for first few samples
+            if j < 8:
+                debug_logger.log_stage("QMF_BUTTERFLY", f"J{j}", [lower[j//2], upper[j//2]], frame=frame_num, band=stage)
+        
+        # Log final QMF outputs
+        debug_logger.log_stage("QMF_FINAL_LOWER", "SAMPLES", lower[:16], frame=frame_num, band=stage)
+        debug_logger.log_stage("QMF_FINAL_UPPER", "SAMPLES", upper[:16], frame=frame_num, band=stage)
+        debug_logger.log_stage("QMF_STATS", "RANGE", [np.min(lower), np.max(lower), np.min(upper), np.max(upper)], frame=frame_num, band=stage)
             
         return lower.tolist(), upper.tolist()
 
@@ -178,27 +198,46 @@ class Atrac1AnalysisFilterBank:
         self.mid_low_tmp = np.zeros(512, dtype=np.float32)  # std::vector<float> MidLowTmp;
         self.delay_buf = np.zeros(self.delay_comp + 512, dtype=np.float32)  # std::vector<float> DelayBuf;
 
-    def analysis(self, pcm_input: list[float]) -> tuple[list[float], list[float], list[float]]:
+    def analysis(self, pcm_input: list[float], frame_num: int = 0) -> tuple[list[float], list[float], list[float]]:
         """
         Exact implementation of atracdenc Atrac1AnalysisFilterBank::Analysis.
         Always returns 256 samples for high band (atracdenc standard).
         """
         pcm_array = np.array(pcm_input, dtype=np.float32)
         
+        # Log PCM input to analysis filter bank to match atracdenc format  
+        debug_logger.log_stage("QMF_ANALYSIS_INPUT", "PCM", pcm_array, frame=frame_num, band="FULL", algorithm="qmf_analysis")
+        
         # atracdenc: memcpy(&DelayBuf[0], &DelayBuf[256], sizeof(float) * delayComp);
+        old_delay = self.delay_buf[:self.delay_comp].copy()
         self.delay_buf[:self.delay_comp] = self.delay_buf[256:256 + self.delay_comp]
+        debug_logger.log_stage("QMF_DELAY_SHIFT", "OLD_NEW", np.concatenate([old_delay[:8], self.delay_buf[:8]]), frame=frame_num, band="FULL")
         
         # atracdenc: Qmf1.Analysis(pcm, &MidLowTmp[0], &DelayBuf[delayComp]);
-        mid_low_list, high_delayed_list = self.qmf1.analysis(pcm_array.tolist())
+        mid_low_list, high_delayed_list = self.qmf1.analysis(pcm_array.tolist(), frame_num, "QMF1")
         self.mid_low_tmp[:len(mid_low_list)] = np.array(mid_low_list, dtype=np.float32)
         self.delay_buf[self.delay_comp:self.delay_comp + len(high_delayed_list)] = np.array(high_delayed_list, dtype=np.float32)
         
+        # Log first QMF stage outputs to match atracdenc format exactly
+        debug_logger.log_stage("QMF1_MIDLOW_OUT", "SAMPLES", self.mid_low_tmp[:256], frame=frame_num, band="FULL", qmf_operation="qmf1_output")
+        debug_logger.log_stage("QMF1_HIGH_DELAYED", "SAMPLES", np.array(high_delayed_list[:256]), frame=frame_num, band="FULL", qmf_operation="qmf1_delayed")
+        
         # atracdenc: Qmf2.Analysis(&MidLowTmp[0], low, mid);
-        low_list, mid_list = self.qmf2.analysis(mid_low_list)
+        low_list, mid_list = self.qmf2.analysis(mid_low_list, frame_num, "QMF2")
         
         # atracdenc: memcpy(hi, &DelayBuf[0], sizeof(float) * 256);
         # Always return 256 samples for high band (as per atracdenc)
         high_list = self.delay_buf[:256].tolist()
+        
+        # Log final outputs for all bands to match atracdenc format
+        debug_logger.log_stage("QMF_FINAL_LOW", "BAND", np.array(low_list), frame=frame_num, band="FULL", qmf_operation="final_output")
+        debug_logger.log_stage("QMF_FINAL_MID", "BAND", np.array(mid_list), frame=frame_num, band="FULL", qmf_operation="final_output")
+        debug_logger.log_stage("QMF_FINAL_HIGH", "BAND", np.array(high_list), frame=frame_num, band="FULL", qmf_operation="final_output")
+        debug_logger.log_stage("QMF_BAND_STATS", "ENERGY", [
+            np.sum(np.array(low_list)**2), 
+            np.sum(np.array(mid_list)**2), 
+            np.sum(np.array(high_list)**2)
+        ], frame=frame_num, band="FULL", statistic="band_energy")
         
         return low_list, mid_list, high_list
 

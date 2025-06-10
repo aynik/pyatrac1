@@ -35,9 +35,15 @@ class TScaler:
             return ScaledBlock(scale_factor_index=0, scaled_values=[], max_energy=0.0)
 
         max_abs_spec = 0.0
+        max_energy = 0.0
         for coeff in spectral_coeffs:
-            if abs(coeff) > max_abs_spec:
-                max_abs_spec = abs(coeff)
+            abs_coeff = abs(coeff)
+            if abs_coeff > max_abs_spec:
+                max_abs_spec = abs_coeff
+            # Store max(coeff*coeff) to match atracdenc
+            energy = coeff * coeff
+            if energy > max_energy:
+                max_energy = energy
 
         if max_abs_spec == 0.0:  # All coeffs are zero
             return ScaledBlock(
@@ -73,8 +79,6 @@ class TScaler:
                 elif scaled_val <= -1.0:
                     scaled_val = -0.99999
                 scaled_values.append(scaled_val)
-
-        max_energy = max_abs_spec
 
         return ScaledBlock(
             scale_factor_index=chosen_scale_factor_index,

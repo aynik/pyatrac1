@@ -1,0 +1,77 @@
+pyatrac1/common/constants.py
+  - atracdenc/src/atrac/atrac1.h (primarily for TAtrac1Data which defines NUM_QMF, NUM_SAMPLES, MAX_BFUS, SOUND_UNIT_SIZE, BITS_PER_BFU_AMOUNT_TAB_IDX, BITS_PER_IDWL, BITS_PER_IDSF).
+  - atracdenc/src/atrac/atrac1.cpp (initialization of some tables within TAtrac1Data).
+  - atracdenc/src/aea.h (for AeaMetaSize -> AEA_META_SIZE).
+  - atracdenc/src/atrac/atrac1_qmf.h (for delayComp -> DELAY_COMP).
+  - atracdenc/src/atrac1denc.h (for LoudFactor -> LOUD_FACTOR).
+  - atracdenc/src/main.cpp or a general config (for SAMPLE_RATE, though it's hardcoded in CalcATH and CreateLoudnessCurve in C++).
+
+pyatrac1/common/utils.py (swap_array)
+  - atracdenc/src/util.h (template function SwapArray).
+
+pyatrac1/core/bit_allocation_logic.py (Atrac1SimpleBitAlloc, BitsBooster)
+  - atracdenc/src/atrac/atrac1_bitalloc.h (defines TAtrac1SimpleBitAlloc, TBitsBooster).
+  - atracdenc/src/atrac/atrac1_bitalloc.cpp (implements TAtrac1SimpleBitAlloc, TBitsBooster).
+
+pyatrac1/core/bitstream.py (TBitStream, Atrac1FrameData, Atrac1BitstreamWriter, Atrac1BitstreamReader)
+  - atracdenc/src/lib/bitstream/bitstream.h (defines TBitStream, MakeSign).
+  - atracdenc/src/lib/bitstream/bitstream.cpp (implements TBitStream).
+  - atracdenc/src/atrac/atrac1_bitalloc.cpp (The TAtrac1BitStreamWriter::WriteBitStream method shows the ATRAC1 frame packing logic, corresponding to Python's Atrac1BitstreamWriter).
+  - atracdenc/src/atrac/atrac1_dequantiser.cpp (The TAtrac1Dequantiser::Dequant method shows the ATRAC1 frame unpacking logic, corresponding to Python's Atrac1BitstreamReader).
+  - atracdenc/src/atrac/atrac1.h (The TAtrac1Data::TBlockSizeMod and other frame structure definitions are relevant here).
+
+pyatrac1/core/codec_data.py (Atrac1CodecData, ScaledBlock)
+  - atracdenc/src/atrac/atrac1.h (defines TAtrac1Data which holds scale tables, sine window, spec/block info).
+  - atracdenc/src/atrac/atrac1.cpp (initializes static members of TAtrac1Data like ScaleTable, SineWindow).
+  - atracdenc/src/atrac/atrac_scale.h (defines TScaledBlock).
+
+pyatrac1/core/decoder.py (Atrac1Decoder)
+  - atracdenc/src/atrac1denc.h (defines TAtrac1Decoder).
+  - atracdenc/src/atrac1denc.cpp (implements TAtrac1Decoder::GetLambda which contains the decoding pipeline).
+  - atracdenc/src/atrac/atrac1_dequantiser.h (defines TAtrac1Dequantiser).
+  - atracdenc/src/atrac/atrac1_dequantiser.cpp (implements TAtrac1Dequantiser::Dequant, corresponding to _dequantize_and_inverse_scale).
+
+pyatrac1/core/encoder.py (Atrac1Encoder)
+  - atracdenc/src/atrac1denc.h (defines TAtrac1Encoder).
+  - atracdenc/src/atrac1denc.cpp (implements TAtrac1Encoder::GetLambda which contains the encoding pipeline).
+
+pyatrac1/core/mdct.py (BlockSizeMode, Atrac1MDCT, low-level MDCT/IMDCT, vector_fmul_window)
+  - atracdenc/src/atrac/atrac1.h (defines TAtrac1Data::TBlockSizeMod which is BlockSizeMode).
+  - atracdenc/src/atrac1denc.h (defines TAtrac1MDCT which is the orchestrator class like Python's Atrac1MDCT).
+  - atracdenc/src/atrac1denc.cpp (implements TAtrac1MDCT::Mdct and TAtrac1MDCT::IMdct, and the static vector_fmul_window).
+  - atracdenc/src/lib/mdct/mdct.h (defines NMDCT::TMDCT and NMDCT::TMIDCT templated classes, corresponding to the low-level MDCT/IMDCT Python classes).
+  - atracdenc/src/lib/mdct/mdct.cpp (implements base for NMDCT::TMDCTBase and C-style DCT functions, though the Python directly implements the FFT-based MDCT logic).
+
+pyatrac1/core/psychoacoustic_model.py (ath_formula_frank, PsychoacousticModel)
+  - atracdenc/src/atrac/atrac_psy_common.h (defines AnalizeScaleFactorSpread, TrackLoudness, CreateLoudnessCurve prototypes).
+  - atracdenc/src/atrac/atrac_psy_common.cpp (implements ATHformula_Frank, AnalizeScaleFactorSpread, CalcATH, CreateLoudnessCurve).
+
+pyatrac1/core/qmf.py (TQmf, Atrac1AnalysisFilterBank, Atrac1SynthesisFilterBank)
+  - atracdenc/src/qmf/qmf.h (defines the TQmf template class).
+  - atracdenc/src/atrac/atrac1_qmf.h (defines Atrac1AnalysisFilterBank and Atrac1SynthesisFilterBank template classes).
+
+pyatrac1/core/scaling_quantization.py (TScaler, quantize_mantissas, BitstreamSignedValues, ScaledBlock)
+  - atracdenc/src/atrac/atrac_scale.h (defines TScaler template, TScaledBlock).
+  - atracdenc/src/atrac/atrac_scale.cpp (implements TScaler template, QuantMantisas).
+  - atracdenc/src/lib/bitstream/bitstream.h (for MakeSign, which corresponds to BitstreamSignedValues).
+
+pyatrac1/core/transient_detection.py (TransientDetector)
+  - atracdenc/src/transient_detector.h (defines TTransientDetector).
+  - atracdenc/src/transient_detector.cpp (implements TTransientDetector, including the HPF FIR coefficients in fircoef).
+
+pyatrac1/tables/bit_allocation.py
+  - atracdenc/src/atrac/atrac1_bitalloc.cpp (static const arrays FixedBitAllocTableLong, FixedBitAllocTableShort, BitBoostMask).
+
+pyatrac1/tables/filter_coeffs.py
+  - atracdenc/src/qmf/qmf.h (for TAP_HALF -> C++ TQmf::TapHalf).
+  - atracdenc/src/atrac/atrac1.cpp (initialization of TAtrac1Data::SineWindow for generate_sine_window).
+  - atracdenc/src/transient_detector.cpp (for HPF_FIR_COEFFS -> C++ fircoef).
+
+pyatrac1/tables/psychoacoustic.py
+  - atracdenc/src/atrac/atrac_psy_common.cpp (static tab array within ATHformula_Frank for ATH_LOOKUP_TABLE; CreateLoudnessCurve for generate_loudness_curve).
+
+pyatrac1/tables/scale_table.py
+  - atracdenc/src/atrac/atrac1.cpp (initialization of TAtrac1Data::ScaleTable).
+
+pyatrac1/tables/spectral_mapping.py
+  - atracdenc/src/atrac/atrac1.h (static const arrays like SpecsPerBlock, BlocksPerBand, SpecsStartLong, SpecsStartShort, BfuAmountTab within TAtrac1Data).

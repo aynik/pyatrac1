@@ -132,13 +132,18 @@ class TestAtrac1SimpleBitAllocCalcBits:
         )
 
         assert len(bits_per_bfu) == num_active_bfus
-        expected_bits = [
-            max(0, FIXED_BIT_ALLOC_TABLE_LONG[i] - shift)
-            for i in range(num_active_bfus)
-        ]
+        # With atracdenc formula: spread * (ScaleFactorIndex/3.2) + (1.0 - spread) * fix - shift
+        # spread=0.5, ScaleFactorIndex=0, shift=0
+        # = 0.5 * (0/3.2) + (1.0 - 0.5) * fix - 0 = 0.5 * fix
+        expected_bits = []
         for i in range(num_active_bfus):
-            if expected_bits[i] == 1:  # 1-bit quantization not allowed
-                expected_bits[i] = 0
+            tmp = 0.5 * FIXED_BIT_ALLOC_TABLE_LONG[i]
+            if tmp > 16:
+                expected_bits.append(16)
+            elif tmp < 2:
+                expected_bits.append(0)
+            else:
+                expected_bits.append(int(tmp))
         assert bits_per_bfu == expected_bits
 
         expected_mantissa_bits = sum(
@@ -162,13 +167,18 @@ class TestAtrac1SimpleBitAllocCalcBits:
         )
 
         assert len(bits_per_bfu) == num_active_bfus
-        expected_bits = [
-            max(0, FIXED_BIT_ALLOC_TABLE_SHORT[i] - shift)
-            for i in range(num_active_bfus)
-        ]
+        # With atracdenc formula: spread * (ScaleFactorIndex/3.2) + (1.0 - spread) * fix - shift
+        # spread=0.5, ScaleFactorIndex=0, shift=1
+        # = 0.5 * (0/3.2) + (1.0 - 0.5) * fix - 1 = 0.5 * fix - 1
+        expected_bits = []
         for i in range(num_active_bfus):
-            if expected_bits[i] == 1:
-                expected_bits[i] = 0
+            tmp = 0.5 * FIXED_BIT_ALLOC_TABLE_SHORT[i] - shift
+            if tmp > 16:
+                expected_bits.append(16)
+            elif tmp < 2:
+                expected_bits.append(0)
+            else:
+                expected_bits.append(int(tmp))
         assert bits_per_bfu == expected_bits
         expected_mantissa_bits = sum(
             bpf * simple_bit_alloc.codec_data.specs_per_block[i]
@@ -207,69 +217,54 @@ class TestAtrac1SimpleBitAllocCalcBits:
         bits_per_bfu, _ = simple_bit_alloc.calc_bits_allocation(
             scaled_blocks, is_long_block, ath_scaled, 0.5, shift
         )
-        expected_bits_no_shift = [
-            FIXED_BIT_ALLOC_TABLE_LONG[i] for i in range(num_active_bfus)
-        ]
+        # With atracdenc formula: spread * (ScaleFactorIndex/3.2) + (1.0 - spread) * fix - shift
+        # spread=0.5, ScaleFactorIndex=0, shift=2
+        # = 0.5 * (0/3.2) + (1.0 - 0.5) * fix - 2 = 0.5 * fix - 2
         for i in range(num_active_bfus):
-            expected_val = max(0, expected_bits_no_shift[i] - shift)
-            if expected_val == 1:
+            tmp = 0.5 * FIXED_BIT_ALLOC_TABLE_LONG[i] - shift
+            if tmp > 16:
+                expected_val = 16
+            elif tmp < 2:
                 expected_val = 0
+            else:
+                expected_val = int(tmp)
             assert bits_per_bfu[i] == expected_val
 
-    def test_calc_bits_allocation_one_bit_becomes_zero(
+    def test_calc_bits_allocation_less_than_2_becomes_zero(
         self, simple_bit_alloc: Atrac1SimpleBitAlloc
     ):
         num_active_bfus = 1
-        # Find an entry in FIXED_BIT_ALLOC_TABLE_LONG that is 1, or can become 1 with a shift
-        # For this test, let's assume FIXED_BIT_ALLOC_TABLE_LONG[0] = 3 and we use shift = 2
-        # This requires knowing the table, or mocking it. For now, assume such a case.
-        # If FIXED_BIT_ALLOC_TABLE_LONG[0] is e.g. 3, shift = 2 makes it 1, then 0.
-        # Let's use a custom fixed_alloc_table for this test by overriding simple_bit_alloc
-        # Or, more simply, find a shift that makes an existing entry 1.
-        # Example: if FIXED_BIT_ALLOC_TABLE_LONG[i] = 3, shift = 2 -> 1 -> 0
-        # Example: if FIXED_BIT_ALLOC_TABLE_LONG[i] = 1, shift = 0 -> 1 -> 0
-        # We need to ensure one of the fixed table entries is 1 or can be shifted to 1.
-        # Let's assume FIXED_BIT_ALLOC_TABLE_LONG[0] is not 0 or 1 initially.
-        # If FIXED_BIT_ALLOC_TABLE_LONG[0] = 2, shift = 1 -> result is 1, then becomes 0.
-        shift_to_make_one = (
-            FIXED_BIT_ALLOC_TABLE_LONG[0] - 1
-            if FIXED_BIT_ALLOC_TABLE_LONG[0] > 1
-            else 0
-        )
-
-        scaled_blocks = create_scaled_blocks(num_active_bfus, max_energy=100.0)
+        # Use values that will generate < 2 bits, which should become 0
+        scaled_blocks = create_scaled_blocks(num_active_bfus, max_energy=100.0, scale_factor_index=0)
         ath_scaled = [10.0] * num_active_bfus
         is_long_block = True
+        # With formula: 0.5 * fix - shift, we need 0.5 * fix - shift < 2
+        # So shift > 0.5 * fix - 2. For FIXED_BIT_ALLOC_TABLE_LONG[0] = 7, 0.5 * 7 = 3.5
+        # So shift > 1.5, use shift = 2
+        shift = 2
 
         bits_per_bfu, _ = simple_bit_alloc.calc_bits_allocation(
-            scaled_blocks, is_long_block, ath_scaled, 0.5, shift_to_make_one
+            scaled_blocks, is_long_block, ath_scaled, 0.5, shift
         )
-        if FIXED_BIT_ALLOC_TABLE_LONG[0] - shift_to_make_one == 1:
-            assert bits_per_bfu[0] == 0
-        # This test is a bit fragile if the table changes. A more robust way would be to mock the table.
+        # Should be 0 because result < 2
+        assert bits_per_bfu[0] == 0
 
-    def test_calc_bits_allocation_max_capped_at_15(
+    def test_calc_bits_allocation_max_capped_at_16(
         self, simple_bit_alloc: Atrac1SimpleBitAlloc
     ):
         num_active_bfus = 1
-        # We need an entry in FIXED_BIT_ALLOC_TABLE_LONG > 15 or shift that makes it > 15
-        # e.g. FIXED_BIT_ALLOC_TABLE_LONG[0] = 10, shift = -6 -> 16, capped to 15
-        shift_to_make_over_15 = (
-            -(16 - FIXED_BIT_ALLOC_TABLE_LONG[0])
-            if FIXED_BIT_ALLOC_TABLE_LONG[0] < 16
-            else 0
-        )
-
-        scaled_blocks = create_scaled_blocks(num_active_bfus, max_energy=100.0)
+        # Use a large scale factor index to generate a large bit allocation that gets capped
+        scaled_blocks = create_scaled_blocks(num_active_bfus, max_energy=100.0, scale_factor_index=60)
         ath_scaled = [10.0] * num_active_bfus
         is_long_block = True
+        shift = -10  # Large negative shift to make allocation > 16
 
         bits_per_bfu, _ = simple_bit_alloc.calc_bits_allocation(
-            scaled_blocks, is_long_block, ath_scaled, 0.5, shift_to_make_over_15
+            scaled_blocks, is_long_block, ath_scaled, 0.5, shift
         )
-        assert bits_per_bfu[0] <= 15
-        if FIXED_BIT_ALLOC_TABLE_LONG[0] - shift_to_make_over_15 > 15:
-            assert bits_per_bfu[0] == 15
+        # With atracdenc formula and large values, should be capped at 16
+        assert bits_per_bfu[0] <= 16
+        assert bits_per_bfu[0] == 16  # Should be capped at max
 
 
 class TestAtrac1SimpleBitAllocIterative:
@@ -426,7 +421,7 @@ class TestBitsBooster:
         assert consumed == 0
 
     def test_apply_boost_priority1_enough_bits(self, bits_booster: BitsBooster):
-        num_active_bfus = 5
+        num_active_bfus = 25  # Include BFUs that are eligible for boost
         # Make BFU 0 and 2 eligible for priority 1 boost (current bits = 0, mask = 1)
         current_bits_per_bfu = [0] * MAX_BFUS
         current_bits_per_bfu[1] = 4  # Not zero
@@ -462,7 +457,7 @@ class TestBitsBooster:
                 assert boosted_bits[i] == original_bfu_idx1[i]
 
     def test_apply_boost_priority2_enough_bits(self, bits_booster: BitsBooster):
-        num_active_bfus = 5
+        num_active_bfus = 25
         current_bits_per_bfu = [0] * MAX_BFUS
         # Make BFU 0 eligible for P2 boost (current bits > 0, mask = 1)
         eligible_indices_for_p2 = [
@@ -493,7 +488,7 @@ class TestBitsBooster:
                 assert boosted_bits[i] == original_full_list[i]
 
     def test_apply_boost_mixed_priorities(self, bits_booster: BitsBooster):
-        num_active_bfus = min(MAX_BFUS, 10)  # Ensure we have enough BFUs to test
+        num_active_bfus = min(MAX_BFUS, 25)  # Ensure we have enough BFUs to test
         current_bits_per_bfu = [0] * MAX_BFUS
 
         # Find indices for P1 and P2 based on BIT_BOOST_MASK
@@ -518,20 +513,23 @@ class TestBitsBooster:
 
         cost_p1 = 2 * bits_booster.codec_data.specs_per_block[p1_idx]
         cost_p2 = 1 * bits_booster.codec_data.specs_per_block[p2_idx]
-        surplus_bits = cost_p1 + cost_p2 + 1  # Enough for both
+        # After P1 boost, p1_idx becomes eligible for P2 boost too
+        cost_p1_p2 = 1 * bits_booster.codec_data.specs_per_block[p1_idx]
+        surplus_bits = cost_p1 + cost_p1_p2 + 1  # Enough for P1 and P1's P2, but not P2's P2
 
         boosted_bits, consumed = bits_booster.apply_boost(
             list(current_bits_per_bfu), surplus_bits, num_active_bfus
         )
 
-        assert boosted_bits[p1_idx] == 2
-        assert boosted_bits[p2_idx] == 4
-        assert consumed == cost_p1 + cost_p2
+        # P1 boost: p1_idx goes 0->2, then P2 boost: only p1_idx goes 2->3 (p2_idx can't afford boost)
+        assert boosted_bits[p1_idx] == 3  # 0 + 2 (P1) + 1 (P2)
+        assert boosted_bits[p2_idx] == 3  # No change (not enough surplus for its boost)
+        assert consumed == cost_p1 + cost_p1_p2
 
     def test_apply_boost_surplus_not_enough_for_full_p1(
         self, bits_booster: BitsBooster
     ):
-        num_active_bfus = 5
+        num_active_bfus = 25
         current_bits_per_bfu = [0] * MAX_BFUS
         eligible_indices_for_p1 = [
             i for i, m in enumerate(BIT_BOOST_MASK[:num_active_bfus]) if m == 1
@@ -553,7 +551,7 @@ class TestBitsBooster:
     def test_apply_boost_surplus_not_enough_for_full_p2(
         self, bits_booster: BitsBooster
     ):
-        num_active_bfus = 5
+        num_active_bfus = 25
         current_bits_per_bfu = [0] * MAX_BFUS
         eligible_indices_for_p2 = [
             i for i, m in enumerate(BIT_BOOST_MASK[:num_active_bfus]) if m == 1
@@ -572,15 +570,15 @@ class TestBitsBooster:
         assert boosted_bits[idx1] == 3  # No boost
         assert consumed == 0
 
-    def test_apply_boost_limited_by_max_word_length_15_p1(
+    def test_apply_boost_limited_by_max_word_length_16_p1(
         self, bits_booster: BitsBooster
     ):
         # P1 boost adds 2 bits to a BFU that currently has 0 bits.
-        # The condition `boosted_bits_per_bfu[i] + 2 <= 15` is checked.
-        # Since 0 + 2 = 2, which is <= 15, P1 boost itself will not be capped by 15.
+        # The condition `boosted_bits_per_bfu[i] + 2 <= 16` is checked.
+        # Since 0 + 2 = 2, which is <= 16, P1 boost itself will not be capped by 16.
         # This test case is therefore not directly applicable for P1 in its current logic.
         # We can verify that a P1 boost happens correctly when eligible.
-        num_active_bfus = 1
+        num_active_bfus = 25
         current_bits_per_bfu = [0] * MAX_BFUS
         idx1 = 0
         # Find first boostable BFU for P1
@@ -606,10 +604,10 @@ class TestBitsBooster:
         assert boosted_bits[idx1] == 2  # Boosted by 2
         assert consumed == cost_for_idx1_boost
 
-    def test_apply_boost_limited_by_max_word_length_15_p2(
+    def test_apply_boost_limited_by_max_word_length_16_p2(
         self, bits_booster: BitsBooster
     ):
-        num_active_bfus = 1
+        num_active_bfus = 25
         current_bits_per_bfu = [0] * MAX_BFUS
         idx1 = 0
         # Find first boostable BFU for P2
@@ -628,21 +626,21 @@ class TestBitsBooster:
         if idx1 == num_active_bfus:
             pytest.skip("No BFU eligible for P2 boost (mask=1 and current_bits > 0)")
 
-        current_bits_per_bfu[idx1] = 15  # Already at max
+        current_bits_per_bfu[idx1] = 16  # Already at max
         cost_for_idx1_boost = 1 * bits_booster.codec_data.specs_per_block[idx1]
         surplus_bits = cost_for_idx1_boost + 5
 
         boosted_bits, consumed = bits_booster.apply_boost(
             list(current_bits_per_bfu), surplus_bits, num_active_bfus
         )
-        assert boosted_bits[idx1] == 15  # No change
+        assert boosted_bits[idx1] == 16  # No change
         assert consumed == 0
 
-        current_bits_per_bfu[idx1] = 14  # One below max
+        current_bits_per_bfu[idx1] = 15  # One below max
         boosted_bits, consumed = bits_booster.apply_boost(
             list(current_bits_per_bfu), surplus_bits, num_active_bfus
         )
-        assert boosted_bits[idx1] == 15  # Boosted by 1
+        assert boosted_bits[idx1] == 16  # Boosted by 1
         assert consumed == cost_for_idx1_boost
 
     def test_apply_boost_respects_bit_boost_mask(self, bits_booster: BitsBooster):

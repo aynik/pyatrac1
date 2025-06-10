@@ -22,6 +22,11 @@ class Atrac1FrameData:
         self.bfu_amount_idx: int = 0
         self.num_active_bfus: int = 0
 
+        # Boolean flags for easier block size mode handling
+        self.low_band_short: bool = False
+        self.mid_band_short: bool = False
+        self.high_band_short: bool = False
+
         self.word_lengths: List[int] = []
         self.scale_factor_indices: List[int] = []
         self.quantized_mantissas: List[List[int]] = []
@@ -242,6 +247,11 @@ class Atrac1BitstreamReader:
         frame_data.bsm_low = 2 - bsm_low_raw
         frame_data.bsm_mid = 2 - bsm_mid_raw  
         frame_data.bsm_high = 3 - bsm_high_raw
+        
+        # Set boolean flags for convenience (log_count == 0 means short block)
+        frame_data.low_band_short = (frame_data.bsm_low == 0)
+        frame_data.mid_band_short = (frame_data.bsm_mid == 0)
+        frame_data.high_band_short = (frame_data.bsm_high == 0)
         
         # Read BFU amount from bits 8-10
         frame_data.bfu_amount_idx = stream.read_bits(3)

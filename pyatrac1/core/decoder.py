@@ -30,9 +30,6 @@ class Atrac1Decoder:
         self.qmf_synthesis_filter_bank = Atrac1SynthesisFilterBank()
         self.bitstream_reader = Atrac1BitstreamReader(self.codec_data)
 
-        self.prev_buf_low = np.zeros(64 // 2, dtype=np.float32).tolist()
-        self.prev_buf_mid = np.zeros(64 // 2, dtype=np.float32).tolist()
-        self.prev_buf_high = np.zeros(64 // 2, dtype=np.float32).tolist()
 
     def _dequantize_and_inverse_scale(
         self,
@@ -95,18 +92,12 @@ class Atrac1Decoder:
         # 1. Frame Disassembly
         frame_data_obj = self.bitstream_reader.read_frame(compressed_frame_bytes)
 
-        # Reconstruct BlockSizeMode from frame_data_obj.bsm_low, bsm_mid, bsm_high
-        # FrameAssembler writes: bsm_low/mid as (0x2 - log_count), bsm_high as (0x3 - log_count)
-        # log_count = 0 means short block.
-        log_count_low = 0x2 - frame_data_obj.bsm_low
-        log_count_mid = 0x2 - frame_data_obj.bsm_mid
-        log_count_high = 0x3 - frame_data_obj.bsm_high
-
-        low_band_short = log_count_low == 0
-        mid_band_short = log_count_mid == 0
-        high_band_short = log_count_high == 0
-
-        block_size_mode = BlockSizeMode(low_band_short, mid_band_short, high_band_short)
+        # Use simplified boolean flags from the bitstream reader
+        block_size_mode = BlockSizeMode(
+            frame_data_obj.low_band_short,
+            frame_data_obj.mid_band_short,
+            frame_data_obj.high_band_short
+        )
 
         # bfu_amount_idx is available in frame_data_obj.bfu_amount_idx if needed.
         _ = frame_data_obj.bfu_amount_idx
@@ -123,14 +114,36 @@ class Atrac1Decoder:
         # 3. Reconstruct flat spectrum from BFU coefficients
         # The encoder creates a flat spectrum with sequential layout: [low, mid, high]
         # We need to reconstruct this from the BFU-organized coefficients
-        from pyatrac1.tables.spectral_mapping import SPECS_START_LONG
+        from pyatrac1.tables.spectral_mapping import SPECS_START_LONG, SPECS_START_SHORT
         from pyatrac1.common import constants
+        
+        def bfu_to_band(bfu_idx: int) -> int:
+            """Map BFU index to band (0=low, 1=mid, 2=high)"""
+            if bfu_idx < 20:
+                return 0  # low band
+            elif bfu_idx < 36:
+                return 1  # mid band
+            else:
+                return 2  # high band
         
         flat_spectrum_coeffs = np.zeros(constants.NUM_SAMPLES, dtype=np.float32)
         
         for bfu_idx, bfu_coeffs in enumerate(mdct_coeffs_per_bfu):
-            if bfu_idx < len(SPECS_START_LONG):
-                start_idx = SPECS_START_LONG[bfu_idx]
+            # Determine which band this BFU belongs to
+            band = bfu_to_band(bfu_idx)
+            
+            # Use the correct SPECS_START table based on block size mode for this band
+            if band == 0 and block_size_mode.low_band_short:
+                specs_start_table = SPECS_START_SHORT
+            elif band == 1 and block_size_mode.mid_band_short:
+                specs_start_table = SPECS_START_SHORT
+            elif band == 2 and block_size_mode.high_band_short:
+                specs_start_table = SPECS_START_SHORT
+            else:
+                specs_start_table = SPECS_START_LONG
+            
+            if bfu_idx < len(specs_start_table):
+                start_idx = specs_start_table[bfu_idx]
                 end_idx = start_idx + len(bfu_coeffs)
                 if end_idx <= constants.NUM_SAMPLES:
                     flat_spectrum_coeffs[start_idx:end_idx] = bfu_coeffs
@@ -145,32 +158,32 @@ class Atrac1Decoder:
         mid_coeffs = flat_spectrum_coeffs[low_mdct_size:low_mdct_size + mid_mdct_size]
         high_coeffs = flat_spectrum_coeffs[low_mdct_size + mid_mdct_size:low_mdct_size + mid_mdct_size + high_mdct_size]
 
-        # 5. IMDCT using atracdenc-compatible interface
-        # Create properly sized output buffers
-        low_buf = np.zeros(256, dtype=np.float64)
-        mid_buf = np.zeros(256, dtype=np.float64)
-        hi_buf = np.zeros(512, dtype=np.float64)
+        # 5. IMDCT using atracdenc-compatible interface  
+        # Create properly sized output buffers with overlap regions
+        low_buf = np.zeros(256 + 16, dtype=np.float64)
+        mid_buf = np.zeros(256 + 16, dtype=np.float64)
+        hi_buf = np.zeros(512 + 16, dtype=np.float64)
         
-        # Initialize overlap buffers from previous state
-        if hasattr(self, 'prev_buf_low') and len(self.prev_buf_low) >= 16:
-            low_buf[-16:] = self.prev_buf_low[:16]
-        if hasattr(self, 'prev_buf_mid') and len(self.prev_buf_mid) >= 16:
-            mid_buf[-16:] = self.prev_buf_mid[:16] 
-        if hasattr(self, 'prev_buf_high') and len(self.prev_buf_high) >= 16:
-            hi_buf[-16:] = self.prev_buf_high[:16]
+        # Initialize overlap regions from previous state if available
+        if hasattr(self, 'prev_overlap_low'):
+            low_buf[256-16:256] = self.prev_overlap_low
+        if hasattr(self, 'prev_overlap_mid'):
+            mid_buf[256-16:256] = self.prev_overlap_mid  
+        if hasattr(self, 'prev_overlap_high'):
+            hi_buf[512-16:512] = self.prev_overlap_high
         
-        # Call atracdenc-compatible IMDCT
+        # Call atracdenc-compatible IMDCT 
         self.mdct_processor.imdct(flat_spectrum_coeffs, block_size_mode, low_buf, mid_buf, hi_buf)
+        
+        # Save overlap regions for next frame
+        self.prev_overlap_low = low_buf[256-16:256].copy()
+        self.prev_overlap_mid = mid_buf[256-16:256].copy()
+        self.prev_overlap_high = hi_buf[512-16:512].copy()
         
         # Extract reconstructed samples for QMF synthesis
         reconstructed_low_samples_list = low_buf[:low_mdct_size].tolist()
         reconstructed_mid_samples_list = mid_buf[:mid_mdct_size].tolist()
         reconstructed_high_samples_list = hi_buf[:high_mdct_size].tolist()
-        
-        # Update overlap buffers for next frame
-        self.prev_buf_low = low_buf[-16:].tolist()
-        self.prev_buf_mid = mid_buf[-16:].tolist()
-        self.prev_buf_high = hi_buf[-16:].tolist()
 
         # 4. QMF Synthesis
         # Ensure inputs to QMF synthesis are correctly sized lists of floats

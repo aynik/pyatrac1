@@ -1,5 +1,6 @@
 __pycache__
 .coverage
+.vscode
 
 .claude
 CLAUDE.md

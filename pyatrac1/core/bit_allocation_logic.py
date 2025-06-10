@@ -36,7 +36,7 @@ class Atrac1SimpleBitAlloc:
         scaled_blocks: List["ScaledBlock"],
         is_long_block: bool,
         ath_scaled: List[float],
-        analize_scale_factor_spread: float,  # pylint: disable=unused-argument
+        analize_scale_factor_spread: float,
         shift: int,
     ) -> Tuple[List[int], int]:
         """
@@ -69,16 +69,26 @@ class Atrac1SimpleBitAlloc:
                 bits_per_bfu[i] = 0
                 continue
 
-            if scaled_blocks[i].max_energy < ath_scaled[i]:
+            # Check if this is a short block for this BFU's band
+            # (simplified band detection - could be made more accurate)
+            is_short_block_for_bfu = not is_long_block  # Simplified for now
+
+            if not is_short_block_for_bfu and scaled_blocks[i].max_energy < ath_scaled[i]:
                 bits_per_bfu[i] = 0
             else:
-                allocated = max(0, fixed_alloc_table[i] - shift)
-                bits_per_bfu[i] = allocated
-
-            if bits_per_bfu[i] == 1:
-                bits_per_bfu[i] = 0
-
-            bits_per_bfu[i] = min(bits_per_bfu[i], 15)  # Max word length (0-15)
+                # Use atracdenc-compatible formula: 
+                # spread * (ScaleFactorIndex/3.2) + (1.0 - spread) * fix - shift
+                fixed_part = fixed_alloc_table[i]
+                scale_factor_part = scaled_blocks[i].scale_factor_index / 3.2
+                tmp = (analize_scale_factor_spread * scale_factor_part + 
+                       (1.0 - analize_scale_factor_spread) * fixed_part - shift)
+                
+                if tmp > 16:
+                    bits_per_bfu[i] = 16
+                elif tmp < 2:
+                    bits_per_bfu[i] = 0
+                else:
+                    bits_per_bfu[i] = int(tmp)
 
         actual_mantissa_bits = 0
         for i in range(num_active_bfus):
@@ -189,7 +199,7 @@ class BitsBooster:
             # BIT_BOOST_MASK is MAX_BFUS long
             if i < MAX_BFUS and BIT_BOOST_MASK[i] == 1 and boosted_bits_per_bfu[i] == 0:
                 cost_for_bfu = 2 * self.codec_data.specs_per_block[i]
-                if cost_for_bfu <= surplus_bits and (boosted_bits_per_bfu[i] + 2 <= 15):
+                if cost_for_bfu <= surplus_bits and (boosted_bits_per_bfu[i] + 2 <= 16):
                     boosted_bits_per_bfu[i] += 2
                     surplus_bits -= cost_for_bfu
                     bits_consumed_by_boost += cost_for_bfu
@@ -200,7 +210,7 @@ class BitsBooster:
                 break
             if i < MAX_BFUS and BIT_BOOST_MASK[i] == 1 and boosted_bits_per_bfu[i] > 0:
                 cost_for_bfu = 1 * self.codec_data.specs_per_block[i]
-                if cost_for_bfu <= surplus_bits and (boosted_bits_per_bfu[i] + 1 <= 15):
+                if cost_for_bfu <= surplus_bits and (boosted_bits_per_bfu[i] + 1 <= 16):
                     boosted_bits_per_bfu[i] += 1
                     surplus_bits -= cost_for_bfu
                     bits_consumed_by_boost += cost_for_bfu
