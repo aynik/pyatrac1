@@ -15,6 +15,7 @@
 #include <iostream>
 #include <iomanip>
 #include <sstream>
+#include <cstring> // For strrchr
 
 // Debug logging control - can be disabled by defining ATRACDENC_NO_DEBUG_LOG
 #ifndef ATRACDENC_NO_DEBUG_LOG
@@ -180,5 +181,25 @@ inline const char* get_basename(const char* path) {
 #define ATRAC_LOG_BITSTREAM_OUTPUT(data, size_bytes, channel, frame) do {} while(0)
 
 #endif // ATRACDENC_DEBUG_ENABLED
+
+// Global context variables for logging
+#if ATRACDENC_DEBUG_ENABLED
+static uint32_t g_debug_channel_ctx = 0;
+static uint32_t g_debug_frame_ctx = 0;
+
+// Function to set the global debug context
+inline void SetDebugContext(uint32_t channel, uint32_t frame) {
+    g_debug_channel_ctx = channel;
+    g_debug_frame_ctx = frame;
+}
+
+// Macros should use g_debug_channel_ctx and g_debug_frame_ctx if available,
+// or pass channel/frame directly if those are function parameters.
+// The current ATRAC_LOG_STAGE takes channel/frame as parameters, which is fine.
+// If SetDebugContext is to be the primary way, macros could be changed later.
+
+#else // ATRACDENC_DEBUG_ENABLED == 0 (dummy SetDebugContext)
+inline void SetDebugContext(uint32_t /*channel*/, uint32_t /*frame*/) {}
+#endif
 
 #endif // DEBUG_LOGGER_H

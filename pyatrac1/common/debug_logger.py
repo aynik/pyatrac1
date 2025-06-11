@@ -219,9 +219,16 @@ def log_bitstream(stage: str, bitstream_bytes: bytes, **kwargs) -> None:
 def enable_debug_logging(log_file: str = "pytrac_debug.log") -> None:
     """
     Enable debug logging with specified log file.
+    This function now reconfigures the existing global logger instance.
     """
     global debug_logger
-    debug_logger = AtracDebugLogger(log_file, enabled=True)
+    debug_logger.log_file = log_file
+    debug_logger.enabled = True
+    # Clear log file and write header
+    with open(debug_logger.log_file, 'w') as f:
+        f.write(f"# PyATRAC1 Debug Log - {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("# Format: [TIMESTAMP][IMPL][FILE:LINE][FUNC][CH{n}][FR{nnn}][BAND_{name}] STAGE: data_type=values |META: ... |SRC: ...\n")
+        f.write("#\n")
 
 
 def disable_debug_logging() -> None:

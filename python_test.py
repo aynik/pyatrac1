@@ -2,6 +2,7 @@ import numpy as np
 from pyatrac1.core.qmf import Atrac1AnalysisFilterBank, Atrac1SynthesisFilterBank
 from pyatrac1.core.mdct import Atrac1MDCT, BlockSizeMode # Import BlockSizeMode
 from pyatrac1.core.codec_data import Atrac1CodecData
+from pyatrac1.common.debug_logger import enable_debug_logging # Import for logging control
 
 # Helper function to write a numpy array to a file
 def write_array_to_file(data, filename):
@@ -14,6 +15,7 @@ def write_array_to_file(data, filename):
     print(f"Data written to {filename}")
 
 def main():
+    enable_debug_logging(log_file="debug_log_python_imdct.txt")
     print("Starting Python test for ATRAC QMF and MDCT...")
 
     try:
@@ -27,11 +29,13 @@ def main():
 
     codec_data = Atrac1CodecData()
 
-    # Define BlockSizeMode for short blocks across all bands
-    # This aligns with the requirement "use BLOCK_SIZE_SHORT for all subbands"
-    # by making all bands use their respective "short" mode.
-    short_block_mode = BlockSizeMode(low_band_short=True, mid_band_short=True, high_band_short=True)
-    print(f"Using MDCT BlockSizeMode: low_short={short_block_mode.low_band_short}, mid_short={short_block_mode.mid_band_short}, high_short={short_block_mode.high_band_short}")
+    # Define BlockSizeMode for MDCT stage (original test used all short)
+    mdct_processing_mode = BlockSizeMode(low_band_short=True, mid_band_short=True, high_band_short=True)
+    print(f"Using MDCT processing BlockSizeMode: low_short={mdct_processing_mode.low_band_short}, mid_short={mdct_processing_mode.mid_band_short}, high_short={mdct_processing_mode.high_band_short}")
+
+    # Define BlockSizeMode for IMDCT stage to match C++ harness (long, long, short_hi_8_blocks)
+    imdct_test_mode = BlockSizeMode(low_band_short=False, mid_band_short=False, high_band_short=True)
+    print(f"Using IMDCT test BlockSizeMode: low_short={imdct_test_mode.low_band_short}, mid_short={imdct_test_mode.mid_band_short}, high_short={imdct_test_mode.high_band_short} -> LogCount={imdct_test_mode.log_count}")
 
     print("\n--- Performing Filter Bank Analysis (QMF) ---")
     analysis_qmf = Atrac1AnalysisFilterBank()
@@ -95,13 +99,13 @@ def main():
             low=qmf_frames_low[i],
             mid=qmf_frames_mid[i],
             hi=qmf_frames_high[i],
-            block_size_mode=short_block_mode,
+            block_size_mode=mdct_processing_mode, # Use original mode for MDCT processing
             channel=0,
             frame=i
         )
         mdct_coeffs_frames.append(frame_specs)
 
-    mdct_coeffs_concat = np.concatenate(mdct_coeffs_frames)
+    # mdct_coeffs_concat = np.concatenate(mdct_coeffs_frames) # Keep this if needed for other outputs
 
     # Split concatenated MDCT coeffs for writing, assuming fixed sizes based on QMF output sizes
     # This matches how atracdenc structures its spectral data before quantization.
@@ -130,15 +134,56 @@ def main():
     imdct_frames_mid = []
     imdct_frames_high = []
 
-    for i in range(num_qmf_frames):
-        frame_specs = mdct_coeffs_frames[i]
+    # Load MDCT coefficients from C++ output files for IMDCT input
+    # This corresponds to USE_CPP_MDCT_OUTPUT = True
+    print("Loading MDCT coefficients from C++ output files for IMDCT...")
+    # Initialize/reset MDCT state (specifically pcm_buf_xxx overlap buffers) before IMDCT test
+    # to match C++ harness starting with zeroed buffers for the first frame.
+    atrac_mdct.initialize_windowing_state(channel=0)
+    print("MDCT persistent buffers reset for IMDCT comparison.")
+    try:
+        cpp_coeffs_low = np.loadtxt("cpp_mdct_coeffs_0.txt", dtype=np.float32)
+        cpp_coeffs_mid = np.loadtxt("cpp_mdct_coeffs_1.txt", dtype=np.float32)
+        cpp_coeffs_high = np.loadtxt("cpp_mdct_coeffs_2.txt", dtype=np.float32)
+    except FileNotFoundError:
+        print("Error: cpp_mdct_coeffs_*.txt files not found. These are needed for IMDCT input.")
+        return
+
+    # Reconstruct per-frame specs arrays from the loaded C++ coefficients
+    loaded_mdct_coeffs_frames = []
+    num_frames_for_imdct = min(num_qmf_frames, len(cpp_coeffs_low) // QMF_FRAME_OUT_LOW_MID) # Process only available frames
+
+    for i in range(num_frames_for_imdct):
+        temp_specs = np.zeros(SPECS_FRAME_SIZE, dtype=np.float32)
+
+        offset_low_mid = i * QMF_FRAME_OUT_LOW_MID
+        offset_high = i * QMF_FRAME_OUT_HIGH
+
+        # Ensure there's enough data in the loaded arrays
+        if offset_low_mid + QMF_FRAME_OUT_LOW_MID > len(cpp_coeffs_low) or \
+           offset_low_mid + QMF_FRAME_OUT_LOW_MID > len(cpp_coeffs_mid) or \
+           offset_high + QMF_FRAME_OUT_HIGH > len(cpp_coeffs_high):
+            print(f"Warning: Not enough C++ coefficient data for frame {i}. Stopping IMDCT input preparation.")
+            break
+
+        temp_specs[0 : QMF_FRAME_OUT_LOW_MID] = cpp_coeffs_low[offset_low_mid : offset_low_mid + QMF_FRAME_OUT_LOW_MID]
+        temp_specs[QMF_FRAME_OUT_LOW_MID : QMF_FRAME_OUT_LOW_MID + QMF_FRAME_OUT_LOW_MID] = cpp_coeffs_mid[offset_low_mid : offset_low_mid + QMF_FRAME_OUT_LOW_MID]
+        temp_specs[QMF_FRAME_OUT_LOW_MID + QMF_FRAME_OUT_LOW_MID : SPECS_FRAME_SIZE] = cpp_coeffs_high[offset_high : offset_high + QMF_FRAME_OUT_HIGH]
+        loaded_mdct_coeffs_frames.append(temp_specs)
+
+    if not loaded_mdct_coeffs_frames:
+        print("Error: No frames could be prepared from loaded C++ MDCT coefficients.")
+        return
+
+    for i in range(len(loaded_mdct_coeffs_frames)):
+        frame_specs_for_imdct = loaded_mdct_coeffs_frames[i] # Use loaded C++ coeffs
         out_low_frame = np.zeros(QMF_FRAME_OUT_LOW_MID, dtype=np.float32)
         out_mid_frame = np.zeros(QMF_FRAME_OUT_LOW_MID, dtype=np.float32)
         out_high_frame = np.zeros(QMF_FRAME_OUT_HIGH, dtype=np.float32)
 
         atrac_mdct.imdct(
-            specs=frame_specs,
-            mode=short_block_mode,
+            specs=frame_specs_for_imdct,
+            mode=imdct_test_mode, # Use the mode matching C++ harness
             low=out_low_frame,
             mid=out_mid_frame,
             hi=out_high_frame,

@@ -250,54 +250,93 @@ void TAtrac1MDCT::Mdct(float Specs[512], float* low, float* mid, float* hi, cons
                           512, "combined");
 }
 void TAtrac1MDCT::IMdct(float Specs[512], const TAtrac1Data::TBlockSizeMod& mode, float* low, float* mid, float* hi) {
+    // TODO: Pass actual channel and frame numbers if possible
+    uint32_t debug_channel = 0;
+    uint32_t debug_frame = 0;
+
+    ATRAC_LOG_STAGE("IMDCT_INPUT_SPECS", "coeffs", Specs, 512, debug_channel, debug_frame, "ALL_BANDS");
+
     uint32_t pos = 0;
     for (size_t band = 0; band < TAtrac1Data::NumQMF; band++) {
+        const char* band_name_str = (band == 0) ? "LOW" : (band == 1) ? "MID" : "HIGH";
         const uint32_t numMdctBlocks = 1 << mode.LogCount[band];
         const uint32_t bufSz = (band == 2) ? 256 : 128;
         const uint32_t blockSz = (numMdctBlocks == 1) ? bufSz : 32;
         uint32_t start = 0;
 
         float* dstBuf = (band == 0) ? low : (band == 1) ? mid : hi;
+        ATRAC_LOG_STAGE("IMDCT_DSTBUF_PRE_MODIFY_BAND", "samples", dstBuf, bufSz * 2, debug_channel, debug_frame, band_name_str, band=band);
 
-        vector<float> invBuf(512);
+        vector<float> invBuf(512); // Increased size to avoid potential overflow if blockSz is large, though 512 is max for ATRAC1
         float* prevBuf = &dstBuf[bufSz * 2  - 16];
         for (uint32_t block = 0; block < numMdctBlocks; block++) {
+            // Log prevBuf for vector_fmul_window
+            ATRAC_LOG_STAGE("IMDCT_PREVBUF_PRE_VMUL", "samples", prevBuf, 16, debug_channel, debug_frame, band_name_str, band=band, block=block);
+
             if (band) {
                 SwapArray(&Specs[pos], blockSz);
             }
             vector<float> inv = (numMdctBlocks != 1) ? Midct64(&Specs[pos]) : (bufSz == 128) ? Midct256(&Specs[pos]) : Midct512(&Specs[pos]);
             for (size_t i = 0; i < (inv.size()/2); i++) {
-                invBuf[start+i] = inv[i + inv.size()/4];
+                // Ensure we don't write past invBuf if inv.size()/4 + i is too large for invBuf's current start offset
+                if (start + i < invBuf.size() && (i + inv.size()/4) < inv.size()) {
+                     invBuf[start+i] = inv[i + inv.size()/4];
+                } else {
+                    // Handle error or log warning if potential out-of-bounds
+                }
             }
 
+            // Log invBuf segment for vector_fmul_window
+            ATRAC_LOG_STAGE("IMDCT_INVBUF_PRE_VMUL", "samples", &invBuf[start], 16, debug_channel, debug_frame, band_name_str, band=band, block=block, inv_start_offset=start);
+
             vector_fmul_window(dstBuf + start, prevBuf, &invBuf[start], &TAtrac1Data::SineWindow[0], 16);
+            // Log output of vector_fmul_window
+            ATRAC_LOG_STAGE("IMDCT_DSTBUF_POST_VMUL", "samples", dstBuf + start, 32, debug_channel, debug_frame, band_name_str, band=band, block=block, dst_start_offset=start);
 
             prevBuf = &invBuf[start+16];
+            // Log prevBuf update
+            ATRAC_LOG_STAGE("IMDCT_PREVBUF_POST_UPDATE", "samples", prevBuf, 16, debug_channel, debug_frame, band_name_str, band=band, block=block, inv_start_offset_for_prev=start+16);
+
             start += blockSz;
             pos += blockSz;
         }
-        if (numMdctBlocks == 1)
-            memcpy(dstBuf + 32, &invBuf[16], ((band == 2) ? 240 : 112) * sizeof(float));
+        if (numMdctBlocks == 1) {
+            uint32_t memcpy_len = ((band == 2) ? 240 : 112);
+            memcpy(dstBuf + 32, &invBuf[16], memcpy_len * sizeof(float));
+            // Log dstBuf after long block memcpy
+            ATRAC_LOG_STAGE("IMDCT_DSTBUF_POST_LONG_MEMCPY", "samples", dstBuf + 32, memcpy_len, debug_channel, debug_frame, band_name_str, band=band, offset=32);
+        }
 
-        // Log buffer state before writing overlap data
-        const char* band_name = (band == 0) ? "LOW" : (band == 1) ? "MID" : "HIGH";
+        // Log buffer state before writing overlap data (existing log)
         ATRAC_LOG_STAGE("BUFFER_STATE_BEFORE_WRITE", "overlap", &dstBuf[bufSz*2 - 16], 16, 
-                       0, 0, band_name,  // TODO: Need access to debug context in IMDCT
-                       algorithm="buffer_tracking", buffer_offset=bufSz*2-16, operation="before_write_overlap");
+                       debug_channel, debug_frame, band_name_str,  // Using new debug_channel/frame
+                       algorithm="buffer_tracking", buffer_offset=bufSz*2-16, operation="before_write_overlap", band=band);
         
         for (size_t j = 0; j < 16; j++) {
-            dstBuf[bufSz*2 - 16  + j] = invBuf[bufSz - 16 + j];
+            if ((bufSz - 16 + j) < invBuf.size()) { // Boundary check for invBuf read
+                dstBuf[bufSz*2 - 16  + j] = invBuf[bufSz - 16 + j];
+            } else {
+                // Handle error or log warning
+            }
         }
+        // Log dstBuf after tail update
+        ATRAC_LOG_STAGE("IMDCT_DSTBUF_POST_TAIL_UPDATE", "samples", &dstBuf[bufSz*2 - 16], 16, debug_channel, debug_frame, band_name_str, band=band, offset=bufSz*2-16);
         
-        // Log buffer state after writing overlap data  
+        // Log buffer state after writing overlap data (existing log)
         ATRAC_LOG_STAGE("BUFFER_STATE_AFTER_WRITE", "overlap", &dstBuf[bufSz*2 - 16], 16,
-                       0, 0, band_name,
-                       algorithm="buffer_tracking", buffer_offset=bufSz*2-16, operation="after_write_overlap");
+                       debug_channel, debug_frame, band_name_str, // Using new debug_channel/frame
+                       algorithm="buffer_tracking", buffer_offset=bufSz*2-16, operation="after_write_overlap", band=band);
         
-        // Log what was written from invBuf
-        ATRAC_LOG_STAGE("BUFFER_OVERLAP_SOURCE", "data", &invBuf[bufSz - 16], 16,
-                       0, 0, band_name,
-                       algorithm="buffer_tracking", source_offset=bufSz-16, operation="overlap_source_data");
+        // Log what was written from invBuf (existing log)
+        // Ensure invBuf read is within bounds
+        size_t invBuf_tail_offset = bufSz - 16;
+        ATRAC_LOG_STAGE("BUFFER_OVERLAP_SOURCE", "data", (invBuf_tail_offset < invBuf.size()) ? &invBuf[invBuf_tail_offset] : nullptr,
+                       (invBuf_tail_offset < invBuf.size()) ? std::min(16UL, invBuf.size() - invBuf_tail_offset) : 0, // Log actual readable size
+                       debug_channel, debug_frame, band_name_str, // Using new debug_channel/frame
+                       algorithm="buffer_tracking", source_offset=invBuf_tail_offset, operation="overlap_source_data", band=band);
+
+        // Log Final dstBuf for the band
+        ATRAC_LOG_STAGE("IMDCT_DSTBUF_FINAL_BAND", "samples", dstBuf, bufSz * 2, debug_channel, debug_frame, band_name_str, band=band);
     }
 }
 

@@ -292,11 +292,11 @@ class Atrac1MDCT:
         Initialize MDCT windowing state to match atracdenc exactly.
         atracdenc constructor explicitly zeros all buffers after initialization.
         """
-        # atracdenc explicitly zeros all buffers in constructor, so we start with zeros
-        # All overlap regions should be zero-initialized
-        self.pcm_buf_low[channel][128:] = 0.0
-        self.pcm_buf_mid[channel][128:] = 0.0
-        self.pcm_buf_hi[channel][256:] = 0.0
+        # atracdenc explicitly zeros all buffers in constructor.
+        # For test harness comparison, ensure full buffer zeroing.
+        self.pcm_buf_low[channel].fill(0.0)
+        self.pcm_buf_mid[channel].fill(0.0)
+        self.pcm_buf_hi[channel].fill(0.0)
         
         # Fixed 32-sample sine window matching atracdenc exactly
         self._atrac1_sine_window = np.array([
@@ -531,131 +531,138 @@ class Atrac1MDCT:
             frame: Frame index for logging
         """
         # Log input spectral coefficients
-        log_debug("IMDCT_INPUT_SPECS", "coeffs", specs.tolist(),
-                  channel=channel, frame=frame, algorithm="imdct")
+        debug_logger.log_stage("IMDCT_INPUT_SPECS", "coeffs", specs.tolist(),
+                               channel=channel, frame=frame, algorithm="imdct")
         
         pos = 0
-        for band in range(self.NUM_QMF):
-            num_mdct_blocks = 1 << mode.log_count[band]
-            buf_sz = 256 if band == 2 else 128
+        for band_idx in range(self.NUM_QMF): # Renamed band to band_idx to avoid conflict with band_name
+            num_mdct_blocks = 1 << mode.log_count[band_idx]
+            buf_sz = 256 if band_idx == 2 else 128
             block_sz = buf_sz if num_mdct_blocks == 1 else 32
             # ATRACDENC ALIGNMENT: Use persistent buffers for TDAC/stateful operations
-            dst_buf = self.pcm_buf_low[channel] if band == 0 else self.pcm_buf_mid[channel] if band == 1 else self.pcm_buf_hi[channel]
+            dst_buf = self.pcm_buf_low[channel] if band_idx == 0 else self.pcm_buf_mid[channel] if band_idx == 1 else self.pcm_buf_hi[channel]
+
+            # Python inv_buf is sized based on current band needs, C++ uses a fixed 512.
+            # For logging inv_buf segments, use appropriate slices matching C++ sizes.
+            # Max length needed for inv_buf elements accessed before windowing: start + 16
+            # Max length needed for inv_buf elements for tail update: buf_sz - 16 + 16 = buf_sz
+            # Max length for inv_buf for long block memcpy: 16 + length (max length is 240, so 256)
+            # Max overall inv_buf size used by atracdenc logic seems to be related to buf_sz or start + block_sz
+            # For simplicity, and to match C++ invBuf(512) for logging purposes where slices are taken,
+            # we can use a large enough buffer or rely on Python's dynamic lists if not using numpy for inv_buf.
+            # Current inv_buf is numpy array: inv_buf = np.zeros(2 * max_block_size * num_mdct_blocks, dtype=np.float32)
+            # This should be sufficient for current band operations.
+
             # ATRACDENC ALIGNMENT: Use np.float32 for inv_buf
-            max_block_size = buf_sz if num_mdct_blocks == 1 else 32
-            inv_buf = np.zeros(2 * max_block_size * num_mdct_blocks, dtype=np.float32)
-            prev_buf = dst_buf[buf_sz * 2 - 16:]  # Use persistent buffer overlap region
+            # Max items in inv_buf in C++ is 512. Python's inv_buf is sized dynamically per band.
+            # For Midct512, inv.size() is 256. inv_buf stores inv.size()/2 = 128 elements.
+            # For Midct256, inv.size() is 128. inv_buf stores inv.size()/2 = 64 elements.
+            # For Midct64, inv.size() is 32. inv_buf stores inv.size()/2 = 16 elements.
+            # The required size for inv_buf for the loop: start + middle_length.
+            # Max middle_length is 128 (from imdct512). Max start can be buf_sz - block_sz.
+            # If long block (num_mdct_blocks=1), start is 0, inv_buf needs middle_length.
+            # If short blocks (num_mdct_blocks=4 or 8), start can go up to buf_sz - 32.
+            # e.g. HIGH band short: num_mdct_blocks=8, buf_sz=256, block_sz=32. start max = 256-32=224. middle_length=16 (from imdct64).
+            # inv_buf needs 224+16 = 240. C++ invBuf is 512. Python inv_buf needs to be large enough.
+            # Current python inv_buf size: 2 * max_block_size * num_mdct_blocks.
+            # For HIGH short: 2 * 32 * 8 = 512. This matches C++.
+            # For LOW/MID short: 2 * 32 * 4 = 256.
+            # For LONG: 2 * buf_sz * 1. LOW/MID: 2*128=256. HIGH: 2*256=512.
+            inv_buf_len_needed = buf_sz # Max index accessed is buf_sz-1 for tail update
+            if num_mdct_blocks > 1: # short blocks
+                 inv_buf_len_needed = max(inv_buf_len_needed, start + (16*num_mdct_blocks) + 16) # Rough upper bound for prev_buf accesses
+            inv_buf = np.zeros(max(512, inv_buf_len_needed), dtype=np.float32) # Ensure large enough, similar to C++ fixed size for safety in logging.
+
+            prev_buf = dst_buf[buf_sz * 2 - 16: buf_sz * 2] # Slice of 16, matches C++ pointer setup
             start = 0
             
-            band_name = ["LOW", "MID", "HIGH"][band]
+            band_name = ["LOW", "MID", "HIGH"][band_idx]
+
+            debug_logger.log_stage("IMDCT_DSTBUF_PRE_MODIFY_BAND", "samples", dst_buf[:buf_sz * 2].tolist(),
+                                   channel=channel, frame=frame, band_name=band_name, band=band_idx)
             
-            # Log IMDCT band parameters
-            log_debug("IMDCT_BAND_PARAMS", "params", [num_mdct_blocks, buf_sz, block_sz],
-                      channel=channel, frame=frame, band=band_name, algorithm="imdct",
-                      num_mdct_blocks=num_mdct_blocks, buf_sz=buf_sz, block_sz=block_sz)
+            # Log IMDCT band parameters (already using debug_logger)
+            debug_logger.log_stage("IMDCT_BAND_PARAMS", "params", [float(num_mdct_blocks), float(buf_sz), float(block_sz)],
+                                   channel=channel, frame=frame, band_name=band_name, algorithm="imdct",
+                                   num_mdct_blocks=num_mdct_blocks, buf_sz=buf_sz, block_sz=block_sz)
             
             for block in range(num_mdct_blocks):
                 specs_len = block_sz
                 
-                # Log input coefficients for this block
-                log_debug("IMDCT_BLOCK_INPUT", "coeffs", specs[pos:pos + specs_len].tolist(),
-                          channel=channel, frame=frame, band=band_name,
-                          algorithm="imdct", block=block)
+                debug_logger.log_stage("IMDCT_BLOCK_INPUT", "coeffs", specs[pos:pos + specs_len].tolist(),
+                                       channel=channel, frame=frame, band_name=band_name,
+                                       algorithm="imdct", block=block)
                 
-                # Swap array if band is not zero
-                if band:
+                if band_idx:
                     self.swap_array(specs[pos:pos + specs_len])
-                    
-                    # Log after swap
-                    log_debug("IMDCT_AFTER_SWAP", "coeffs", specs[pos:pos + specs_len].tolist(),
-                              channel=channel, frame=frame, band=band_name,
-                              algorithm="imdct", block=block, operation="swap_array")
+                    debug_logger.log_stage("IMDCT_AFTER_SWAP", "coeffs", specs[pos:pos + specs_len].tolist(),
+                                           channel=channel, frame=frame, band_name=band_name,
+                                           algorithm="imdct", block=block, operation="swap_array")
 
-                # Select the appropriate IMDCT function
                 if num_mdct_blocks != 1:
                     inv = self.imdct64(specs[pos:pos + specs_len])
+                    imdct_engine_name = "imdct64"
                 elif buf_sz == 128:
-                    inv = self.imdct256(specs[pos:pos + buf_sz])
-                else:
-                    inv = self.imdct512(specs[pos:pos + buf_sz])
+                    inv = self.imdct256(specs[pos:pos + buf_sz]) # Use full buf_sz for long blocks
+                    imdct_engine_name = "imdct256"
+                else: # buf_sz == 256
+                    inv = self.imdct512(specs[pos:pos + buf_sz]) # Use full buf_sz for long blocks
+                    imdct_engine_name = "imdct512"
 
-                # Log raw IMDCT output
-                log_debug("IMDCT_RAW_OUTPUT", "samples", inv.tolist(),
-                          channel=channel, frame=frame, band=band_name,
-                          algorithm="imdct", block=block, imdct_engine=f"imdct{len(inv)}")
+                debug_logger.log_stage("IMDCT_RAW_OUTPUT", "samples", inv.tolist(),
+                                       channel=channel, frame=frame, band_name=band_name,
+                                       algorithm="imdct", block=block, imdct_engine=imdct_engine_name)
 
                 inv_len = len(inv)
-                # atracdenc CRITICAL: Only store middle half of IMDCT output (lines 269-271)
-                # for (size_t i = 0; i < (inv.size()/2); i++) {
-                #     invBuf[start+i] = inv[i + inv.size()/4];
-                # }
-                # EXACT ATRACDENC MATCH: Extract inv[i + inv.size()/4] for i=0..inv.size()/2-1
-                middle_start = inv_len // 4        # 64 (atracdenc: inv.size()/4)
-                middle_length = inv_len // 2       # 128 (atracdenc: inv.size()/2)
+                middle_start = inv_len // 4
+                middle_length = inv_len // 2
                 inv_buf[start:start + middle_length] = inv[middle_start:middle_start + middle_length]
 
-                # Log windowing input buffers
-                log_debug("IMDCT_WINDOW_INPUTS", "prev_buf", prev_buf.tolist(),
-                          channel=channel, frame=frame, band=band_name,
-                          algorithm="imdct", block=block, operation="vector_fmul_window_prep")
-                log_debug("IMDCT_WINDOW_INPUTS", "inv_buf_segment", inv_buf[start:start + inv_len // 2].tolist(),
-                          channel=channel, frame=frame, band=band_name,
-                          algorithm="imdct", block=block, operation="vector_fmul_window_prep")
+                debug_logger.log_stage("IMDCT_PREVBUF_PRE_VMUL", "samples", prev_buf.tolist(), # prev_buf is already 16 floats
+                                       channel=channel, frame=frame, band_name=band_name, block=block)
+                debug_logger.log_stage("IMDCT_INVBUF_PRE_VMUL", "samples", inv_buf[start:start + 16].tolist(), # Log 16 floats from inv_buf[start]
+                                       channel=channel, frame=frame, band_name=band_name, block=block, inv_start_offset=start)
 
-                # Ensure dst_buf has enough space
-                dst_len_required = start + 2 * 16  # Since vector_fmul_window accesses up to index [2*len - 1]
-                assert len(dst_buf) >= dst_len_required, "dst_buf too small"
+                dst_len_required = start + 32
+                assert len(dst_buf) >= dst_len_required, f"dst_buf too small ({len(dst_buf)}) for required ({dst_len_required})"
 
-                # CRITICAL: atracdenc uses pointer arithmetic - we need to handle indexing correctly
-                # vector_fmul_window(dstBuf + start, prevBuf, &invBuf[start], &TAtrac1Data::SineWindow[0], 16);
+                temp_dst = np.zeros(32, dtype=np.float32)
+                temp_src1 = inv_buf[start:start + 16] # This is correct, 16 elements for src1
                 
-                # Create properly sized temporary arrays for vector_fmul_window
-                temp_dst = np.zeros(32, dtype=np.float32)  # 2 * 16 = 32
-                temp_src1 = inv_buf[start:start + 16]
-                
-                # ATRACDENC ALIGNMENT: Ensure np.float32 sine window for vector_fmul_window
                 vector_fmul_window(
-                    temp_dst,  # dst (will use indices -16 to 15)
-                    prev_buf,  # src0
-                    temp_src1,  # src1
-                    np.array(self.SINE_WINDOW, dtype=np.float32),
+                    temp_dst,
+                    prev_buf, # src0 is 16 elements
+                    temp_src1, # src1 is 16 elements
+                    np.array(self.SINE_WINDOW, dtype=np.float32), # win is 32 elements, vector_fmul_window uses 16
                     16
                 )
                 
-                # Copy result back to destination buffer
                 dst_buf[start:start + 32] = temp_dst
 
-                # Log windowing output
-                log_debug("IMDCT_WINDOW_OUTPUT", "samples", dst_buf[start:start + 32].tolist(),
-                          channel=channel, frame=frame, band=band_name,
-                          algorithm="imdct", block=block, operation="vector_fmul_window_output")
+                debug_logger.log_stage("IMDCT_DSTBUF_POST_VMUL", "samples", dst_buf[start:start + 32].tolist(),
+                                       channel=channel, frame=frame, band_name=band_name, block=block, dst_start_offset=start)
 
-                # Update prev_buf for next iteration (atracdenc line 275)
-                # prevBuf = &invBuf[start+16];
-                prev_buf = inv_buf[start + 16:start + 16 + 16]  # 16 samples starting at start+16
+                prev_buf = inv_buf[start + 16:start + 16 + 16]
+                debug_logger.log_stage("IMDCT_PREVBUF_POST_UPDATE", "samples", prev_buf.tolist(),
+                                       channel=channel, frame=frame, band_name=band_name, block=block, inv_start_offset_for_prev=start+16)
+
                 start += block_sz
                 pos += block_sz
 
             if num_mdct_blocks == 1:
-                length = 240 if band == 2 else 112
-                # Copy middle non-overlapped portion from raw IMDCT output (atracdenc line 90)
-                # memcpy(dstBuf + 32, &invBuf[16], ((band == 2) ? 240 : 112) * sizeof(float));
+                length = 240 if band_idx == 2 else 112
                 dst_buf[32:32 + length] = inv_buf[16:16 + length]
-                
-                # Log long block copy
-                log_debug("IMDCT_LONG_COPY", "samples", dst_buf[32:32 + length].tolist(),
-                          channel=channel, frame=frame, band=band_name,
-                          algorithm="imdct", operation="long_block_copy", length=length)
+                debug_logger.log_stage("IMDCT_DSTBUF_POST_LONG_MEMCPY", "samples", dst_buf[32:32 + length].tolist(),
+                                       channel=channel, frame=frame, band_name=band_name,
+                                       offset=32, length=length)
 
-            # Store current tail for next frame (atracdenc lines 92-93)
-            # for (size_t j = 0; j < 16; j++) { dstBuf[bufSz*2 - 16 + j] = invBuf[bufSz - 16 + j]; }
             for j in range(16):
                 dst_buf[buf_sz * 2 - 16 + j] = inv_buf[buf_sz - 16 + j]
+            debug_logger.log_stage("IMDCT_DSTBUF_POST_TAIL_UPDATE", "samples", dst_buf[buf_sz*2 - 16 : buf_sz*2].tolist(),
+                                   channel=channel, frame=frame, band_name=band_name, offset=buf_sz*2-16)
             
-            # Log final output for this band
-            log_debug("IMDCT_BAND_OUTPUT", "samples", dst_buf.tolist(),
-                      channel=channel, frame=frame, band=band_name,
-                      algorithm="imdct", processing_stage="final")
+            debug_logger.log_stage("IMDCT_DSTBUF_FINAL_BAND", "samples", dst_buf[:buf_sz * 2].tolist(),
+                                   channel=channel, frame=frame, band_name=band_name, band=band_idx)
         
         # ATRACDENC ALIGNMENT: Copy from persistent buffers to output arguments at the end
         # Copy only the main data portion, not the overlap regions
