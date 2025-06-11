@@ -285,7 +285,8 @@ class Atrac1MDCT:
         # Initialize atracdenc-compatible sine window
         self.SINE_WINDOW = [0.0] * 32
         for i in range(32):
-            self.SINE_WINDOW[i] = np.sin((i + 0.5) * (np.pi / (2.0 * 32.0)))
+            self.SINE_WINDOW[i] = np.sin((i + 0.5) / 32.0 * np.pi / 2.0)
+        self.SINE_WINDOW_MIRRORED = self.SINE_WINDOW[::-1]
     
     def initialize_windowing_state(self, channel: int = 0):
         """
@@ -626,22 +627,41 @@ class Atrac1MDCT:
                 dst_len_required = start + 32
                 assert len(dst_buf) >= dst_len_required, f"dst_buf too small ({len(dst_buf)}) for required ({dst_len_required})"
 
-                temp_dst = np.zeros(32, dtype=np.float32)
-                temp_src1 = inv_buf[start:start + 16] # This is correct, 16 elements for src1
+                # --- TDAC Implementation Start as per prompt ---
+                block_size_div_2 = 16  # Half of the SINE_WINDOW length (32)
                 
-                vector_fmul_window(
-                    temp_dst,
-                    prev_buf, # src0 is 16 elements
-                    temp_src1, # src1 is 16 elements
-                    np.array(self.SINE_WINDOW, dtype=np.float32), # win is 32 elements, vector_fmul_window uses 16
-                    16
-                )
-                
-                dst_buf[start:start + 32] = temp_dst
+                swm_arr = np.array(self.SINE_WINDOW_MIRRORED, dtype=np.float32) # Full 32-element mirrored window
+                # Ensure we only use the first half of SWM for windowing as per prompt [k] (0-15)
+                swm_k_half = swm_arr[:block_size_div_2]
+                neg_swm_k_half = -swm_k_half
 
-                debug_logger.log_stage("IMDCT_DSTBUF_POST_VMUL", "samples", dst_buf[start:start + 32].tolist(),
+                # Current IMDCT output parts for this 32-sample window segment in inv_buf
+                current_imdct_part1 = inv_buf[start : start + block_size_div_2]
+                current_imdct_part2 = inv_buf[start + block_size_div_2 : start + 2 * block_size_div_2]
+
+                # "prev_buf_segment" for the second half of the TDAC formula.
+                # This refers to the content of dst_buf at that position *before* this TDAC step modifies it.
+                # prev_buf (16 samples) is for the first half.
+                # dst_buf_content_for_prev_part2 is for the second half.
+                dst_buf_content_for_prev_part2 = dst_buf[start + block_size_div_2 : start + 2 * block_size_div_2].copy()
+
+                # Loop 1: (prev_samples_first_half[k] - current_imdct_first_half[k]) * SINE_WINDOW_MIRRORED[k]
+                # prev_buf_segment[k] is prev_buf[k] (16-sample inter-block/frame overlap from previous iteration or frame end)
+                # current_imdct_output_segment[k] is current_imdct_part1[k]
+                for k_tdac in range(block_size_div_2):
+                    dst_buf[start + k_tdac] = (prev_buf[k_tdac] - current_imdct_part1[k_tdac]) * swm_k_half[k_tdac]
+
+                # Loop 2: (current_imdct_second_half[k] - previous_dst_buf_samples_second_half[k]) * SINE_WINDOW_MIRRORED[k]
+                # current_imdct_output_segment[BS_HALF+k] is current_imdct_part2[k_tdac]
+                # prev_buf_segment[BS_HALF+k] is dst_buf_content_for_prev_part2[k_tdac] (content of dst_buf before this block's TDAC)
+                for k_tdac in range(block_size_div_2):
+                    dst_buf[start + block_size_div_2 + k_tdac] = (current_imdct_part2[k_tdac] - dst_buf_content_for_prev_part2[k_tdac]) * swm_k_half[k_tdac]
+                # --- TDAC Implementation End ---
+                
+                debug_logger.log_stage("IMDCT_DSTBUF_POST_VMUL", "samples", dst_buf[start:start + 32].tolist(), # Log the 32 modified samples
                                        channel=channel, frame=frame, band_name=band_name, block=block, dst_start_offset=start)
 
+                # This update remains crucial for the *next* iteration's prev_buf or for tail storage
                 prev_buf = inv_buf[start + 16:start + 16 + 16]
                 debug_logger.log_stage("IMDCT_PREVBUF_POST_UPDATE", "samples", prev_buf.tolist(),
                                        channel=channel, frame=frame, band_name=band_name, block=block, inv_start_offset_for_prev=start+16)
