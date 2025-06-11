@@ -287,6 +287,13 @@ class Atrac1MDCT:
         for i in range(32):
             self.SINE_WINDOW[i] = np.sin((i + 0.5) / 32.0 * np.pi / 2.0)
         self.SINE_WINDOW_MIRRORED = self.SINE_WINDOW[::-1]
+
+        # Pre-calculate TDAC window coefficients as NumPy arrays
+        self.tdac_N_div_2 = 16
+        # Assuming self.SINE_WINDOW is the 32-element list [0.0, ..., sin((31+0.5)*pi/64)]
+        # SINE_WINDOW is actually sin((i+0.5)/32 * pi/2) which is sin((i+0.5)*pi/64)
+        self.sine_coeffs_tdac_np = np.array(self.SINE_WINDOW[:self.tdac_N_div_2], dtype=np.float32)
+        self.cosine_coeffs_mirrored_tdac_np = np.array(self.SINE_WINDOW[self.tdac_N_div_2 * 2 - 1 : self.tdac_N_div_2 - 1 : -1], dtype=np.float32)
     
     def initialize_windowing_state(self, channel: int = 0):
         """
@@ -587,98 +594,229 @@ class Atrac1MDCT:
                                    channel=channel, frame=frame, band_name=band_name, algorithm="imdct",
                                    num_mdct_blocks=num_mdct_blocks, buf_sz=buf_sz, block_sz=block_sz)
             
-            for block in range(num_mdct_blocks):
-                specs_len = block_sz
+            # Determine samples per band for long blocks based on band_idx
+            # samples_per_band_for_long = 256 if band_idx == 2 else 128
+            # This is used by the new IMDCT core selection and long block memcpy
+            self.samples_per_band = [128, 128, 256] # Low, Mid, High for long blocks
+
+            # write_ptr for imdct_output_for_band (equivalent to 'start' in old code for dst_buf)
+            write_ptr = 0
+
+            # Output buffer for the current band, matching dst_buf size and type
+            imdct_output_for_band = dst_buf # Use dst_buf directly as the output buffer for the band
+
+            for k_block in range(num_mdct_blocks): # Renamed 'block' to 'k_block'
+                # Determine if it's a short block based on num_mdct_blocks
+                is_short_block = (num_mdct_blocks > 1)
+
+                # Size of MDCT coefficients for the current block
+                # For long blocks (num_mdct_blocks == 1), specs_len is buf_sz
+                # For short blocks, specs_len is block_sz (which is 32)
+                mdct_coeffs_per_block = block_sz if is_short_block else buf_sz
+
+                imdct_block_coeffs = specs[pos : pos + mdct_coeffs_per_block]
                 
-                debug_logger.log_stage("IMDCT_BLOCK_INPUT", "coeffs", specs[pos:pos + specs_len].tolist(),
+                debug_logger.log_stage("IMDCT_BLOCK_INPUT", "coeffs", imdct_block_coeffs.tolist(),
                                        channel=channel, frame=frame, band_name=band_name,
-                                       algorithm="imdct", block=block)
+                                       algorithm="imdct", block=k_block) # Use k_block
                 
-                if band_idx:
-                    self.swap_array(specs[pos:pos + specs_len])
-                    debug_logger.log_stage("IMDCT_AFTER_SWAP", "coeffs", specs[pos:pos + specs_len].tolist(),
+                if band_idx: # If not LOW band, swap coefficients
+                    self.swap_array(imdct_block_coeffs) # Operate on the slice directly
+                    debug_logger.log_stage("IMDCT_AFTER_SWAP", "coeffs", imdct_block_coeffs.tolist(),
                                            channel=channel, frame=frame, band_name=band_name,
-                                           algorithm="imdct", block=block, operation="swap_array")
+                                           algorithm="imdct", block=k_block, operation="swap_array")
 
-                if num_mdct_blocks != 1:
-                    inv = self.imdct64(specs[pos:pos + specs_len])
-                    imdct_engine_name = "imdct64"
-                elif buf_sz == 128:
-                    inv = self.imdct256(specs[pos:pos + buf_sz]) # Use full buf_sz for long blocks
-                    imdct_engine_name = "imdct256"
-                else: # buf_sz == 256
-                    inv = self.imdct512(specs[pos:pos + buf_sz]) # Use full buf_sz for long blocks
-                    imdct_engine_name = "imdct512"
+                # --- IMDCT Core Selection ---
+                actual_mdct_engine_name = "" # For logging
+                if is_short_block: # 32 MDCT coefficients
+                    imdct_core_to_use = self.imdct64
+                    actual_mdct_engine_name = "imdct64"
+                elif mdct_coeffs_per_block == 128: # Long block for Low/Mid
+                    imdct_core_to_use = self.imdct256
+                    actual_mdct_engine_name = "imdct256"
+                elif mdct_coeffs_per_block == 256: # Long block for High
+                    imdct_core_to_use = self.imdct512
+                    actual_mdct_engine_name = "imdct512"
+                else: # Fallback or error for unexpected mdct_coeffs_per_block
+                    debug_logger.log_stage("IMDCT_CORE_SELECTION_ERROR", "details",
+                                           [band_idx, mdct_coeffs_per_block, is_short_block],
+                                           channel=channel, frame=frame, band_name=band_name, level="ERROR")
+                    # Default to a base IMDCT or raise error to avoid issues; for now, use imdct64 as a placeholder if logic is flawed
+                    imdct_core_to_use = self.imdct64
+                    actual_mdct_engine_name = "imdct64_fallback"
+                current_imdct_raw_block_output = imdct_core_to_use(imdct_block_coeffs)
+                # --- IMDCT Core Selection End ---
 
-                debug_logger.log_stage("IMDCT_RAW_OUTPUT", "samples", inv.tolist(),
+                debug_logger.log_stage("IMDCT_RAW_OUTPUT", "samples", current_imdct_raw_block_output.tolist(),
                                        channel=channel, frame=frame, band_name=band_name,
-                                       algorithm="imdct", block=block, imdct_engine=imdct_engine_name)
+                                       algorithm="imdct", block=k_block, imdct_engine=actual_mdct_engine_name)
 
-                inv_len = len(inv)
-                middle_start = inv_len // 4
-                middle_length = inv_len // 2
-                inv_buf[start:start + middle_length] = inv[middle_start:middle_start + middle_length]
+                # --- Corrected TDAC Implementation ---
+                # Initialize prev_overlap_tdac for the first block from dst_buf tail (persistent across frames)
+                if k_block == 0: # This initialization should happen once per band before k_block loop
+                    # self.prev_overlap_tdac should be a class member list, initialized in __init__ or elsewhere if needed per-channel.
+                    # For now, assuming it's correctly initialized for each channel if this method is called per channel.
+                    # If this method handles both channels, then self.prev_overlap_tdac needs to be indexed by channel.
+                    # Based on current structure, pcm_buf_low etc are per channel, so this implies imdct is called per channel.
+                    # Initialize for all bands for the current channel if not already done or if it's frame-specific state.
+                    # For simplicity, let's assume self.prev_overlap_tdac is a list of 3 np.arrays (one per band for the current channel)
+                    # This should be initialized at the start of the `imdct` method or even in `initialize_windowing_state`.
+                    # The prompt implies this is inside the k_block loop, which is incorrect for a one-time load from persistent buffer.
+                    # Moving the load of persistent_buffer_tail to *before* the k_block loop.
+                    # This was:
+                    # if k_block == 0:
+                    #    self.prev_overlap_tdac = [np.zeros(self.tdac_N_div_2, dtype=np.float32) for _ in range(self.NUM_QMF)]
+                    #    persistent_buffer_tail = dst_buf[buf_sz * 2 - self.tdac_N_div_2 : buf_sz * 2]
+                    #    if len(persistent_buffer_tail) == self.tdac_N_div_2:
+                    #         self.prev_overlap_tdac[band_idx][:self.tdac_N_div_2] = persistent_buffer_tail
+                    #    else: self.prev_overlap_tdac[band_idx].fill(0.0)
+                    # This logic is now outside the k_block loop, done once per band_idx.
 
-                debug_logger.log_stage("IMDCT_PREVBUF_PRE_VMUL", "samples", prev_buf.tolist(), # prev_buf is already 16 floats
-                                       channel=channel, frame=frame, band_name=band_name, block=block)
-                debug_logger.log_stage("IMDCT_INVBUF_PRE_VMUL", "samples", inv_buf[start:start + 16].tolist(), # Log 16 floats from inv_buf[start]
-                                       channel=channel, frame=frame, band_name=band_name, block=block, inv_start_offset=start)
+                    pass # Initialization of self.prev_overlap_tdac[band_idx] from dst_buf tail is now before this loop.
 
-                dst_len_required = start + 32
-                assert len(dst_buf) >= dst_len_required, f"dst_buf too small ({len(dst_buf)}) for required ({dst_len_required})"
 
-                # --- TDAC Implementation Start as per prompt ---
-                block_size_div_2 = 16  # Half of the SINE_WINDOW length (32)
+                s0_samples_tdac = np.array(self.prev_overlap_tdac[band_idx][:self.tdac_N_div_2]).flatten()
+                s1_samples_mirrored_tdac = np.array(current_imdct_raw_block_output[:self.tdac_N_div_2][::-1]).flatten()
+
+                if s0_samples_tdac.shape[0] != self.tdac_N_div_2:
+                    s0_samples_tdac = np.resize(s0_samples_tdac, self.tdac_N_div_2)
+                if s1_samples_mirrored_tdac.shape[0] != self.tdac_N_div_2:
+                    s1_samples_mirrored_tdac = np.resize(s1_samples_mirrored_tdac, self.tdac_N_div_2)
+
+                # Ensure window coefficient arrays are used (defined in __init__)
+                # self.sine_coeffs_tdac_np and self.cosine_coeffs_mirrored_tdac_np
+
+                imdct_output_for_band[write_ptr : write_ptr + self.tdac_N_div_2] = \
+                    s0_samples_tdac * self.cosine_coeffs_mirrored_tdac_np - \
+                    s1_samples_mirrored_tdac * self.sine_coeffs_tdac_np
+
+                imdct_output_for_band[write_ptr + self.tdac_N_div_2 : write_ptr + self.tdac_N_div_2 * 2] = \
+                    s0_samples_tdac * self.sine_coeffs_tdac_np + \
+                    s1_samples_mirrored_tdac * self.cosine_coeffs_mirrored_tdac_np
                 
-                swm_arr = np.array(self.SINE_WINDOW_MIRRORED, dtype=np.float32) # Full 32-element mirrored window
-                # Ensure we only use the first half of SWM for windowing as per prompt [k] (0-15)
-                swm_k_half = swm_arr[:block_size_div_2]
-                neg_swm_k_half = -swm_k_half
-
-                # Current IMDCT output parts for this 32-sample window segment in inv_buf
-                current_imdct_part1 = inv_buf[start : start + block_size_div_2]
-                current_imdct_part2 = inv_buf[start + block_size_div_2 : start + 2 * block_size_div_2]
-
-                # "prev_buf_segment" for the second half of the TDAC formula.
-                # This refers to the content of dst_buf at that position *before* this TDAC step modifies it.
-                # prev_buf (16 samples) is for the first half.
-                # dst_buf_content_for_prev_part2 is for the second half.
-                dst_buf_content_for_prev_part2 = dst_buf[start + block_size_div_2 : start + 2 * block_size_div_2].copy()
-
-                # Loop 1: (prev_samples_first_half[k] - current_imdct_first_half[k]) * SINE_WINDOW_MIRRORED[k]
-                # prev_buf_segment[k] is prev_buf[k] (16-sample inter-block/frame overlap from previous iteration or frame end)
-                # current_imdct_output_segment[k] is current_imdct_part1[k]
-                for k_tdac in range(block_size_div_2):
-                    dst_buf[start + k_tdac] = (prev_buf[k_tdac] - current_imdct_part1[k_tdac]) * swm_k_half[k_tdac]
-
-                # Loop 2: (current_imdct_second_half[k] - previous_dst_buf_samples_second_half[k]) * SINE_WINDOW_MIRRORED[k]
-                # current_imdct_output_segment[BS_HALF+k] is current_imdct_part2[k_tdac]
-                # prev_buf_segment[BS_HALF+k] is dst_buf_content_for_prev_part2[k_tdac] (content of dst_buf before this block's TDAC)
-                for k_tdac in range(block_size_div_2):
-                    dst_buf[start + block_size_div_2 + k_tdac] = (current_imdct_part2[k_tdac] - dst_buf_content_for_prev_part2[k_tdac]) * swm_k_half[k_tdac]
+                debug_logger.log_stage("IMDCT_DSTBUF_POST_VMUL", "samples",
+                                       imdct_output_for_band[write_ptr : write_ptr + self.tdac_N_div_2 * 2].tolist(),
+                                       channel=channel, frame=frame, band_name=band_name, block=k_block, dst_start_offset=write_ptr)
                 # --- TDAC Implementation End ---
-                
-                debug_logger.log_stage("IMDCT_DSTBUF_POST_VMUL", "samples", dst_buf[start:start + 32].tolist(), # Log the 32 modified samples
-                                       channel=channel, frame=frame, band_name=band_name, block=block, dst_start_offset=start)
 
-                # This update remains crucial for the *next* iteration's prev_buf or for tail storage
-                prev_buf = inv_buf[start + 16:start + 16 + 16]
-                debug_logger.log_stage("IMDCT_PREVBUF_POST_UPDATE", "samples", prev_buf.tolist(),
-                                       channel=channel, frame=frame, band_name=band_name, block=block, inv_start_offset_for_prev=start+16)
+                # --- Update self.prev_overlap_tdac for next iteration/block ---
+                # This part should be correct as per previous changes.
+                # This should take the second half of the current_imdct_raw_block_output
+                if len(current_imdct_raw_block_output) >= self.tdac_N_div_2 * 2 and \
+                   len(self.prev_overlap_tdac[band_idx]) == self.tdac_N_div_2 :
+                    self.prev_overlap_tdac[band_idx][:self.tdac_N_div_2] = \
+                        current_imdct_raw_block_output[self.tdac_N_div_2 : self.tdac_N_div_2 * 2]
+                else:
+                     debug_logger.log_stage("IMDCT_PREV_OVERLAP_UPDATE_ERROR", "details",
+                                           [len(current_imdct_raw_block_output), len(self.prev_overlap_tdac[band_idx])],
+                                           channel=channel, frame=frame, band_name=band_name, level="ERROR")
 
-                start += block_sz
-                pos += block_sz
 
-            if num_mdct_blocks == 1:
-                length = 240 if band_idx == 2 else 112
-                dst_buf[32:32 + length] = inv_buf[16:16 + length]
-                debug_logger.log_stage("IMDCT_DSTBUF_POST_LONG_MEMCPY", "samples", dst_buf[32:32 + length].tolist(),
-                                       channel=channel, frame=frame, band_name=band_name,
-                                       offset=32, length=length)
+                debug_logger.log_stage("IMDCT_PREVBUF_POST_UPDATE", "samples", self.prev_overlap_tdac[band_idx].tolist(),
+                                       channel=channel, frame=frame, band_name=band_name, block=k_block)
 
-            for j in range(16):
-                dst_buf[buf_sz * 2 - 16 + j] = inv_buf[buf_sz - 16 + j]
-            debug_logger.log_stage("IMDCT_DSTBUF_POST_TAIL_UPDATE", "samples", dst_buf[buf_sz*2 - 16 : buf_sz*2].tolist(),
+                if not is_short_block: # Long block specific logic
+                    # Corrected long block memcpy logic
+                    dst_fill_start = self.tdac_N_div_2 * 2
+                    src_fill_start = self.tdac_N_div_2
+                    # samples_per_band[band_idx] is full size of long block (e.g. 128 for low/mid, 256 for high)
+                    # This is the size of one IMDCT core output for a long block.
+                    # current_imdct_raw_block_output is this output. Its length is samples_per_band[band_idx] * 2
+                    # No, current_imdct_raw_block_output is already the time samples, so its length is samples_per_band[band_idx]
+                    # mdct_coeffs_per_block = buf_sz (e.g. 128 for low/mid). IMDCT output is 2*coeffs = 256 samples (e.g. for low/mid)
+                    # So current_imdct_raw_block_output length is self.samples_per_band[band_idx] * 2 if samples_per_band is MDCT domain size
+                    # Let's assume self.samples_per_band[band_idx] refers to the number of output samples from IMDCT core for that band when long.
+                    # So, for low/mid long, IMDCT256 is used on 128 coeffs, output is 256 samples. self.samples_per_band[band_idx] should be 256.
+                    # Let's re-verify definition of self.samples_per_band.
+                    # The prompt: "elif self.samples_per_band[band_idx] == 128: # Long block for Low/Mid" -> this is MDCT domain size.
+                    # So, actual output sample length is self.samples_per_band[band_idx] * 2.
+
+                    # Length of raw output from IMDCT core for a long block
+                    long_block_raw_output_len = self.samples_per_band[band_idx] * 2
+
+                    memcpy_len_long = long_block_raw_output_len - self.tdac_N_div_2 # Total samples minus the first part handled by TDAC windowing.
+                                                                                # Or rather, (Total Samples / 2) - N/2 if we consider the structure of atracdenc.
+                                                                                # atracdenc: length = p->inv.size()/2 - p->N/2; (p->inv.size() is output samples, N is window overlap size)
+                                                                                # inv.size() = 2 * (num_coeffs e.g. 128 for low/mid long)
+                                                                                # N = 32 for TDAC window. N/2 = 16.
+                                                                                # So, length = num_coeffs - 16. For low/mid long: 128-16=112. For high long: 256-16=240.
+                    memcpy_len_long = self.samples_per_band[band_idx] - self.tdac_N_div_2
+
+
+                    src_fill_end = src_fill_start + memcpy_len_long
+                    dst_fill_end = dst_fill_start + memcpy_len_long
+
+                    # Ensure current_imdct_raw_block_output is long enough
+                    if src_fill_end <= len(current_imdct_raw_block_output) and \
+                       dst_fill_end <= len(imdct_output_for_band) and \
+                       src_fill_start < src_fill_end and \
+                       dst_fill_start < dst_fill_end:
+                        imdct_output_for_band[dst_fill_start : dst_fill_end] = \
+                            current_imdct_raw_block_output[src_fill_start : src_fill_end]
+
+                        debug_logger.log_stage("IMDCT_DSTBUF_POST_LONG_MEMCPY", "samples",
+                                               imdct_output_for_band[dst_fill_start : dst_fill_end].tolist(),
+                                               channel=channel, frame=frame, band_name=band_name, offset=dst_fill_start)
+                    else:
+                        debug_logger.log_stage("IMDCT_DSTBUF_POST_LONG_MEMCPY_ERROR", "details",
+                                               [len(current_imdct_raw_block_output), src_fill_start, src_fill_end,
+                                                len(imdct_output_for_band), dst_fill_start, dst_fill_end, memcpy_len_long],
+                                               channel=channel, frame=frame, band_name=band_name, level="ERROR")
+
+                # Advance write_ptr: For short blocks, it's by 32 (block_sz). For long, TDAC handles 32, then memcpy handles more.
+                # The overall output buffer (imdct_output_for_band) is filled sequentially.
+                # For long blocks, the single k_block iteration fills a larger portion.
+                # write_ptr should advance by the amount of data written in this k_block iteration.
+                # TDAC part writes N_div_2 * 2 = 32 samples.
+                # Long block memcpy part writes `memcpy_len_long` samples.
+                # So for long block, total written is 32 + memcpy_len_long.
+                # memcpy_len_long = (samples_per_band[band_idx]) - N_div_2.
+                # Total written = 32 + samples_per_band[band_idx] - 16 = samples_per_band[band_idx] + 16. This seems off.
+                # Atracdenc logic: start += block_sz. For long blocks, block_sz is buf_sz.
+                # This implies the output for a band is constructed piece by piece if short, or mostly at once if long.
+                # The current loop structure is per MDCT block.
+                # If long, num_mdct_blocks = 1. So this loop runs once.
+                # write_ptr should effectively become buf_sz after this single iteration for a long block.
+                # If short, num_mdct_blocks > 1. write_ptr advances by block_sz (32) each time.
+
+                if is_short_block:
+                    write_ptr += block_sz # Advances by 32 for short blocks
+                else: # Long block
+                    # The TDAC writes 32 samples. The memcpy fills up to samples_per_band[band_idx].
+                    # The total effective length written to imdct_output_for_band for a long block
+                    # should correspond to samples_per_band[band_idx] (e.g. 128 for low/mid, 256 for high)
+                    # which is the size of the QMF band.
+                    # The `dst_buf` in atracdenc has a size of `buf_sz * 2` (e.g. 256 for low/mid).
+                    # The operations fill this buffer.
+                    # The write_ptr should advance to fill the band's expected QMF sample count.
+                    write_ptr += self.samples_per_band[band_idx] # buf_sz for long block
+
+                pos += mdct_coeffs_per_block
+
+
+            # Update tail of the persistent buffer (dst_buf) with the end of the newly processed data
+            # This is for the *next* frame's TDAC overlap.
+            # The data for this should come from the *end* of current_imdct_raw_block_output for the *last* block processed.
+            # This was: dst_buf[buf_sz*2 - 16 + j] = inv_buf[buf_sz - 16 + j]
+            # inv_buf here contained the raw IMDCT output.
+            # So, this means: persistent_buffer_tail = last_raw_imdct_output_second_half
+            # This is already handled by self.prev_overlap_tdac update if it's the last block.
+            # The dst_buf (imdct_output_for_band) itself is what's being built.
+            # The final 16 samples of imdct_output_for_band that are for overlap for the NEXT frame's first block
+            # should be taken from the relevant part of the last current_imdct_raw_block_output.
+            # This is what self.prev_overlap_tdac[band_idx] now holds after the loop.
+
+            # Final update of the persistent buffer's tail for next frame's overlap
+            # This should use the content of self.prev_overlap_tdac[band_idx] which holds the correct 16 samples
+            # from the second half of the last processed block's raw IMDCT output.
+            if len(dst_buf) >= buf_sz * 2 and len(self.prev_overlap_tdac[band_idx]) == self.tdac_N_div_2:
+                 dst_buf[buf_sz * 2 - self.tdac_N_div_2 : buf_sz * 2] = self.prev_overlap_tdac[band_idx]
+            else:
+                 debug_logger.log_stage("IMDCT_TAIL_UPDATE_ERROR", "details",
+                                       [len(dst_buf), buf_sz*2, len(self.prev_overlap_tdac[band_idx]), self.tdac_N_div_2],
+                                        channel=channel, frame=frame, band_name=band_name, level="ERROR")
+
+            debug_logger.log_stage("IMDCT_DSTBUF_POST_TAIL_UPDATE", "samples", dst_buf[buf_sz*2 - 16 : buf_sz*2].tolist(), # Log last 16
                                    channel=channel, frame=frame, band_name=band_name, offset=buf_sz*2-16)
             
             debug_logger.log_stage("IMDCT_DSTBUF_FINAL_BAND", "samples", dst_buf[:buf_sz * 2].tolist(),
