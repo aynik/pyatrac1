@@ -52,21 +52,43 @@ class TScaler:
                 max_energy=0.0,
             )
 
-        chosen_scale_factor_index = 0
-        chosen_scale_factor = self.codec_data.scale_table[0]  # Default to smallest
+        # Align with C++: clip max_abs_spec to MAX_SCALE (1.0) before finding scale factor
+        if max_abs_spec > 1.0:
+            # This matches C++ TAtrac1Data::MAX_SCALE behavior
+            # print(f"Scale warning: max_abs_spec ({max_abs_spec}) > 1.0, clipping to 1.0") # Optional: for debugging
+            max_abs_spec = 1.0
 
-        # Iterate through scale_table to find the smallest factor >= max_abs_spec
-        # The scale_table values are increasing.
-        for i, factor_val in enumerate(self.codec_data.scale_table):
-            if factor_val >= max_abs_spec:
-                chosen_scale_factor_index = i
-                chosen_scale_factor = factor_val
-                break
+        chosen_scale_factor_index = 0
+        # Default to the largest scale factor if max_abs_spec is smaller than all table entries
+        # or if it's 0. However, ScaleTable[0] is usually the smallest non-zero.
+        # C++ uses lower_bound, which finds the first element not less than max_abs_spec.
+        # If max_abs_spec is 0, it will find the first element in the map (smallest scale factor).
+        # If max_abs_spec is > largest value, it would be end().
+
+        # Find the smallest factor in scale_table >= max_abs_spec
+        # The scale_table values are sorted and increasing.
+        # ScaleTable[0] is the smallest, ScaleTable[63] is the largest (1.0 for Atrac1)
+
+        # If max_abs_spec is 0.0, C++ lower_bound would give ScaleTable[0]
+        # If max_abs_spec is > 0, find appropriate factor
+        if max_abs_spec == 0.0:
+             # All coeffs are zero, already handled, but if not, this would be the path
+            chosen_scale_factor_index = 0 # Or an index corresponding to smallest factor
         else:
-            # If max_abs_spec is larger than any value in scale_table,
-            # use the largest scale factor.
-            chosen_scale_factor_index = len(self.codec_data.scale_table) - 1
-            chosen_scale_factor = self.codec_data.scale_table[chosen_scale_factor_index]
+            # Find first scale_factor >= max_abs_spec
+            found_factor = False
+            for i, factor_val in enumerate(self.codec_data.scale_table):
+                if factor_val >= max_abs_spec:
+                    chosen_scale_factor_index = i
+                    found_factor = True
+                    break
+            if not found_factor:
+                # This case should ideally not be hit if max_abs_spec <= 1.0 and 1.0 is in table.
+                # If max_abs_spec was > 1.0 and clipped, and 1.0 is largest, this won't be hit.
+                # If table doesn't contain 1.0 but max_abs_spec is 1.0, use largest.
+                chosen_scale_factor_index = len(self.codec_data.scale_table) - 1
+
+        chosen_scale_factor = self.codec_data.scale_table[chosen_scale_factor_index]
 
         scaled_values: List[float] = []
         if chosen_scale_factor == 0:
@@ -94,6 +116,11 @@ def _round_half_away_from_zero(x: float) -> int:
     else:
         return int(x - 0.5)
 
+def _round_half_to_even(x: float) -> int:
+    """Replicates C's lrint rounding behavior (round half to even) using np.rint."""
+    # np.rint rounds to the nearest even integer for .5 cases
+    # and then we cast to int.
+    return int(np.rint(x))
 
 def quantize_mantissas(
     scaled_values: List[float],
@@ -137,7 +164,8 @@ def quantize_mantissas(
         # Initial quantization
         for val in scaled_values:
             original_energy += val * val
-            int_mantissa = _round_half_away_from_zero(val * max_quant_val)
+            # Use round half to even, matching C++ lrint via ToInt()
+            int_mantissa = _round_half_to_even(val * max_quant_val)
             int_mantissa = max(-max_quant_val, min(int_mantissa, max_quant_val))
             mantissas.append(int_mantissa)
 
@@ -156,67 +184,103 @@ def quantize_mantissas(
 
             current_quantized_energy_ea = calculate_q_energy_ea(mantissas)
             # Max iterations for the adjustment loop as a safeguard
-            max_ea_loops = len(scaled_values) + 5
-            for _ea_loop_count in range(max_ea_loops):
-                best_improvement_metric = abs(
-                    current_quantized_energy_ea - original_energy
-                )
-                candidate_index_to_flip = -1
-                new_mantissa_for_candidate = 0
-                improved_energy_for_candidate = 0.0
+            # Calculate initial quantized_energy from initial mantissas
+            current_quantized_energy = 0.0
+            if max_quant_val > 0:
+                dequant_factor = 1.0 / max_quant_val
+                for m_val in mantissas:
+                    dequantized_val = m_val * dequant_factor
+                    current_quantized_energy += dequantized_val * dequantized_val
+            else: # Should not happen for wl >= 2
+                current_quantized_energy = 0.0
 
-                for i in range(len(scaled_values)):
-                    s_val_scaled = scaled_values[i] * max_quant_val
-                    if s_val_scaled == float(mantissas[i]):  # Already exact
-                        continue
+            # C++ EA logic starts here
+            candidates = [] # List of (abs_delta, original_index, t_original)
 
-                    m_floor = math.floor(s_val_scaled)
-                    m_ceil = math.ceil(s_val_scaled)
-                    current_m_i = mantissas[i]
-                    alt_m_i = 0  # Alternative mantissa
+            for i, scaled_val in enumerate(scaled_values):
+                t_original = scaled_val * max_quant_val
 
-                    if current_m_i == m_floor:
-                        alt_m_i = m_ceil
-                    elif current_m_i == m_ceil:
-                        alt_m_i = m_floor
-                    else:
-                        # This path should not be hit if current_m_i was from rounding
-                        continue
+                # Calculate delta: t - (trunc(t) + copysign(0.5, t))
+                # For t = 0, copysign(0.5, 0) is 0.5. trunc(0)+0.5 = 0.5. delta = -0.5. abs(delta)=0.5. Not candidate.
+                # This is fine as t=0 typically means mantissa is 0 and won't be adjusted by this logic.
+                ref_point = np.trunc(t_original) + np.copysign(0.5, t_original)
+                delta = t_original - ref_point
 
-                    clamped_alt_m_i = max(-max_quant_val, min(alt_m_i, max_quant_val))
-                    if (
-                        clamped_alt_m_i == current_m_i
-                    ):  # Alternative is same after clamping
-                        continue
+                if abs(delta) < 0.25:
+                    # Store abs(delta), original index, and t_original (scaled_val * max_quant_val)
+                    candidates.append((abs(delta), i, t_original))
 
-                    temp_mantissas_list = list(
-                        mantissas
-                    )  # Use a different name to avoid confusion
-                    temp_mantissas_list[i] = clamped_alt_m_i
-                    temp_q_energy = calculate_q_energy_ea(temp_mantissas_list)
-                    new_improvement_metric = abs(temp_q_energy - original_energy)
+            if not candidates:
+                quantized_energy = current_quantized_energy
+                return mantissas, original_energy, quantized_energy
 
-                    if new_improvement_metric < best_improvement_metric:
-                        best_improvement_metric = new_improvement_metric
-                        candidate_index_to_flip = i
-                        new_mantissa_for_candidate = clamped_alt_m_i
-                        improved_energy_for_candidate = temp_q_energy
+            # Sort candidates by abs(delta) in ascending order
+            candidates.sort(key=lambda x: x[0])
 
-                if candidate_index_to_flip != -1:  # An improvement was found
-                    mantissas[candidate_index_to_flip] = new_mantissa_for_candidate
-                    current_quantized_energy_ea = improved_energy_for_candidate
-                else:  # No improvement found in this pass
-                    break
-            quantized_energy = current_quantized_energy_ea  # Final q_energy from EA
+            # Iterative adjustment based on sorted candidates
+            for _, original_idx, t_original_for_candidate in candidates:
+                # Calculate current total quantized energy for comparison (e2 in C++)
+                # This needs to be recalculated if a mantissa changed in a previous iteration.
+                # Or, update current_quantized_energy incrementally. Let's do incremental.
+
+                # Test conditions for increasing or decreasing magnitude
+                current_mantissa_val = mantissas[original_idx]
+                m_new = current_mantissa_val # trial new mantissa
+
+                candidate_made_change = False
+
+                if current_quantized_energy < original_energy:
+                    # Try to increase quantized energy by increasing mantissa magnitude
+                    # Conditions: abs(current_mantissa) < abs(t_original) AND abs(current_mantissa) < max_quant_val - 1
+                    if abs(current_mantissa_val) < abs(t_original_for_candidate) and \
+                       abs(current_mantissa_val) < max_quant_val -1: # max_quant_val-1 is like C++ (mul-1)
+
+                        if current_mantissa_val > 0:
+                            m_new = current_mantissa_val + 1
+                        elif current_mantissa_val < 0:
+                            m_new = current_mantissa_val - 1
+                        else: # current_mantissa_val == 0
+                            m_new = 1 if t_original_for_candidate > 0 else -1
+
+                        # Clamp m_new (though conditions might make this redundant)
+                        m_new = max(-max_quant_val, min(m_new, max_quant_val))
+                        candidate_made_change = True
+
+                elif current_quantized_energy > original_energy:
+                    # Try to decrease quantized energy by decreasing mantissa magnitude
+                    # Condition: abs(current_mantissa) > abs(t_original)
+                    if abs(current_mantissa_val) > abs(t_original_for_candidate):
+                        if current_mantissa_val > 0:
+                            m_new = current_mantissa_val - 1
+                        elif current_mantissa_val < 0:
+                            m_new = current_mantissa_val + 1
+                        # if current_mantissa_val == 0, no change as per this condition.
+                        candidate_made_change = True
+
+                if candidate_made_change and m_new != current_mantissa_val:
+                    # Check if this change improves overall energy match
+                    old_term_energy = (current_mantissa_val * dequant_factor)**2
+                    new_term_energy = (m_new * dequant_factor)**2
+
+                    trial_quantized_energy = current_quantized_energy - old_term_energy + new_term_energy
+
+                    error_before_change = abs(current_quantized_energy - original_energy)
+                    error_after_change = abs(trial_quantized_energy - original_energy)
+
+                    if error_after_change < error_before_change:
+                        mantissas[original_idx] = m_new
+                        current_quantized_energy = trial_quantized_energy
+
+            quantized_energy = current_quantized_energy
         else:
-            # No energy adjustment, or max_quant_val is 0 (not possible for wl>=2)
+            # No energy adjustment (wl < 2 or EA flag off)
             # Calculate quantized_energy directly from initial mantissas
-            if max_quant_val > 0:  # True for word_length >= 2
+            if max_quant_val > 0:
                 dequant_factor = 1.0 / max_quant_val
                 for m_val in mantissas:
                     dequantized_val = m_val * dequant_factor
                     quantized_energy += dequantized_val * dequantized_val
-            # If max_quant_val was 0 (not possible for wl>=2), q_energy remains 0.0
+            # If max_quant_val was 0, q_energy remains 0.0 (already initialized)
 
     return mantissas, original_energy, quantized_energy
 
