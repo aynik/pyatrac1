@@ -8,14 +8,14 @@ import math
 import numpy as np  # type: ignore
 from typing import List, Optional
 from pyatrac1.core.codec_data import ScaledBlock
-from pyatrac1.tables.psychoacoustic import ATH_LOOKUP_TABLE, generate_loudness_curve
+from pyatrac1.tables.psychoacoustic import ATH_MILLIBEL_TAB_INTERNAL, generate_loudness_curve
 from pyatrac1.common.constants import LOUD_FACTOR
 
 
 def ath_formula_frank(frequency: float) -> float:
     """
     Calculates the Absolute Threshold of Hearing (ATH) at a given frequency
-    using the ATHformula_Frank method from the ATRAC1 specification.
+    using a lookup table and linear interpolation, based on atracdenc's implementation.
 
     Args:
         frequency: The frequency in Hz.
@@ -23,64 +23,51 @@ def ath_formula_frank(frequency: float) -> float:
     Returns:
         The ATH value in decibels.
     """
-    freq = max(10.0, min(29853.0, frequency))
-    target_freq_log = 40.0 * math.log10(0.1 * freq) if freq > 0 else -float("inf")
+    freq = max(10.0, min(29853.0, frequency)) # Matches C++ limits more closely
 
-    # Find two closest frequencies in the lookup table for interpolation
-    lower_idx = 0
-    upper_idx = len(ATH_LOOKUP_TABLE) - 1
+    # freq_log calculation from C++
+    # 4 steps per third, starting at 10 Hz. Max index will be < 128 for freq <= 29853 Hz
+    freq_log = 40.0 * math.log10(0.1 * freq) if freq > 0 else 0.0
+    index = math.floor(freq_log)
 
-    for i in range(len(ATH_LOOKUP_TABLE) - 1):
-        if ATH_LOOKUP_TABLE[i][0] <= freq <= ATH_LOOKUP_TABLE[i + 1][0]:
-            lower_idx = i
-            upper_idx = i + 1
-            break
+    # Ensure index is within bounds for the table (0 to 126 for interpolation tab[index+1])
+    # Max C++ index is 127. So index can go up to 127.
+    # If index is 127, index+1 is 128, which is out of bounds for a 128-element list.
+    # The C++ code uses tab[index] and tab[index+1]. So index must be <= 126.
+    index = max(0, min(int(index), len(ATH_MILLIBEL_TAB_INTERNAL) - 2))
 
-    if freq < ATH_LOOKUP_TABLE[0][0]:
-        lower_idx = 0
-        upper_idx = 0
-    elif freq > ATH_LOOKUP_TABLE[-1][0]:
-        lower_idx = len(ATH_LOOKUP_TABLE) - 1
-        upper_idx = len(ATH_LOOKUP_TABLE) - 1
+    # Linear interpolation from C++
+    # result = tab [index] * (1 + index - freq_log) + tab [index+1] * (freq_log - index)
+    val1 = ATH_MILLIBEL_TAB_INTERNAL[index]
+    val2 = ATH_MILLIBEL_TAB_INTERNAL[index+1]
+    interpolated_millibel = val1 * (1.0 + index - freq_log) + val2 * (freq_log - index)
 
-    f0_hz = ATH_LOOKUP_TABLE[lower_idx][0]
-    f1_hz = ATH_LOOKUP_TABLE[upper_idx][0]
+    # Convert millibels to dB
+    ath_db = 0.01 * interpolated_millibel
+    return ath_db
 
-    # Calculate freq_log for the table's bracketing frequencies
-    freq_log_f0 = 40.0 * math.log10(0.1 * f0_hz) if f0_hz > 0 else -float("inf")
-    freq_log_f1 = 40.0 * math.log10(0.1 * f1_hz) if f1_hz > 0 else -float("inf")
 
-    interpolated_mb_values_at_target_freq_log: List[float] = []
+def calc_ath_spectrum_db(num_spectral_lines: int, sample_rate: float) -> List[float]:
+    """
+    Calculates the ATH for each spectral line, similar to C++ CalcATH.
+    The resulting values are in dB.
+    """
+    ath_spectrum_db_values: List[float] = []
+    for i in range(num_spectral_lines):
+        # Calculate f_khz = (i + 1.0) * (sample_rate / 2000.0) / num_spectral_lines
+        # Ensure floating point division
+        f_khz = (float(i) + 1.0) * (sample_rate / 2000.0) / float(num_spectral_lines)
 
-    for k in range(4):
-        mb_at_f0 = float(ATH_LOOKUP_TABLE[lower_idx][k + 1])
-        mb_at_f1 = float(ATH_LOOKUP_TABLE[upper_idx][k + 1])
+        # Call ath_formula_frank to get base ATH dB
+        # The frequency input to ath_formula_frank is in Hz
+        ath_frank_output = ath_formula_frank(f_khz * 1000.0)
 
-        if freq_log_f0 == freq_log_f1 or target_freq_log == -float("inf"):
-            interpolated_k = mb_at_f0
-        elif freq_log_f0 == -float("inf") and freq_log_f1 == -float("inf"):
-            interpolated_k = mb_at_f0
-        else:
-            denominator = freq_log_f1 - freq_log_f0
-            if denominator == 0:
-                interpolated_k = mb_at_f0
-            else:
-                interpolation_factor = (target_freq_log - freq_log_f0) / denominator
-                interpolation_factor = max(0.0, min(1.0, interpolation_factor))
-                interpolated_k = mb_at_f0 + (mb_at_f1 - mb_at_f0) * interpolation_factor
-        interpolated_mb_values_at_target_freq_log.append(interpolated_k)
+        # Further adjustments as per C++ CalcATH
+        ath_db = ath_frank_output - 100.0
+        ath_db -= f_khz * f_khz * 0.015 # Equivalent to C++: trh -= freq * freq * 0.015f; (where freq is in kHz)
 
-    if not interpolated_mb_values_at_target_freq_log:
-        final_interpolated_mb = 0.0
-    else:
-        final_interpolated_mb = sum(interpolated_mb_values_at_target_freq_log) / len(
-            interpolated_mb_values_at_target_freq_log
-        )
-
-    trh = final_interpolated_mb * 0.01
-    trh -= freq * freq * 0.015
-
-    return trh
+        ath_spectrum_db_values.append(ath_db)
+    return ath_spectrum_db_values
 
 
 class PsychoacousticModel:

@@ -16,6 +16,7 @@ from pyatrac1.core.scaling_quantization import TScaler, quantize_mantissas, Scal
 from pyatrac1.core.bit_allocation_logic import Atrac1SimpleBitAlloc, BitsBooster
 
 from pyatrac1.common import constants
+from pyatrac1.common.utils import bfu_to_band # New import
 from pyatrac1.tables.spectral_mapping import SPECS_START_LONG, SPECS_START_SHORT
 
 
@@ -71,17 +72,8 @@ class Atrac1Encoder:
     ) -> float:
         """Calculates a representative frequency for a BFU."""
         if block_size_mode is not None:
-            # Helper function to determine band from BFU index (matches atracdenc BfuToBand)
-            def bfu_to_band(bfu_idx: int) -> int:
-                if bfu_idx < 20:
-                    return 0  # low band
-                elif bfu_idx < 36:
-                    return 1  # mid band
-                else:
-                    return 2  # high band
-            
             # Determine which band this BFU belongs to
-            band = bfu_to_band(bfu_index)
+            band = bfu_to_band(bfu_index) # Uses imported bfu_to_band
             
             # Use correct SPECS_START table based on block size mode for this band
             if ((band == 0 and block_size_mode.low_band_short) or 
@@ -206,48 +198,28 @@ class Atrac1Encoder:
             channel_loudness_val, window_masks_ch0=channel_window_mask_td
         )
 
-        chosen_bfu_amount_idx = 7
-        num_active_bfus = self.codec_data.bfu_amount_tab[chosen_bfu_amount_idx]
+        initial_bfu_amount_idx = 7
+        num_active_bfus_for_prep = self.codec_data.bfu_amount_tab[initial_bfu_amount_idx]
 
-        ath_per_bfu_scaled: List[float] = []
-        is_long_mode_for_ath = not (
-            block_size_mode.low_band_short
-            or block_size_mode.mid_band_short
-            or block_size_mode.high_band_short
-        )
-        for i in range(num_active_bfus):
-            freq_bfu = self._get_representative_freq_for_bfu(i, is_long_mode_for_ath, block_size_mode)
-            ath_db = ath_formula_frank(freq_bfu)
-            ath_linear_amplitude = 10 ** (ath_db / 20.0)
-            effective_ath_threshold = ath_linear_amplitude
-            if overall_loudness > 1e-9:
-                effective_ath_threshold = ath_linear_amplitude / overall_loudness
-            else:
-                effective_ath_threshold = float("inf")
-
-            ath_per_bfu_scaled.append(effective_ath_threshold)
+        # Prepare ath_for_comparison_per_bfu for num_active_bfus_for_prep
+        ath_for_comparison_per_bfu: List[float] = [0.0] * num_active_bfus_for_prep
+        # overall_loudness is available in this scope.
+        for i in range(num_active_bfus_for_prep):
+            # Ensure access to ath_long_min_energy_table is safe (it's MAX_BFUS long)
+            base_ath_energy = self.codec_data.ath_long_min_energy_table[i]
+            ath_value = base_ath_energy * overall_loudness
+            ath_for_comparison_per_bfu[i] = ath_value # Assign to list directly
         
-        # Log ATH calculations
-        log_debug("PSYCHO_ATH", "thresholds", ath_per_bfu_scaled,
+        log_debug("PSYCHO_ATH_COMPARISON", "comparison_values", ath_for_comparison_per_bfu,
                   channel=channel_idx, frame=frame_idx,
-                  algorithm="ath_calculation", overall_loudness=overall_loudness,
-                  num_active_bfus=num_active_bfus, is_long_mode=is_long_mode_for_ath)
+                  algorithm="ath_comparison_preparation", overall_loudness=overall_loudness,
+                  num_active_bfus_prepared_for=num_active_bfus_for_prep)
 
-        # Helper function to determine band from BFU index (matches atracdenc BfuToBand)
-        def bfu_to_band(bfu_idx: int) -> int:
-            if bfu_idx < 20:
-                return 0  # low band
-            elif bfu_idx < 36:
-                return 1  # mid band
-            else:
-                return 2  # high band
-
+        # Prepare scaled_blocks_channel for num_active_bfus_for_prep
         scaled_blocks_channel: List[ScaledBlock] = []
-        for i in range(num_active_bfus):
+        for i in range(num_active_bfus_for_prep):
             num_specs_in_bfu = self.codec_data.specs_per_block[i]
-            
-            # Determine which band this BFU belongs to
-            band = bfu_to_band(i)
+            band = bfu_to_band(i) # Ensure bfu_to_band is imported and available
             
             # Use correct SPECS_START table based on block size mode for this band
             if ((band == 0 and block_size_mode.low_band_short) or 
@@ -271,60 +243,71 @@ class Atrac1Encoder:
                       scale_factor=scaled_block.scale_factor_index,
                       max_energy=scaled_block.max_energy)
 
-        spread_factor = psy_model.analyze_scale_factor_spread(scaled_blocks_channel)
+        spread_factor = psy_model.analyze_scale_factor_spread(scaled_blocks_channel) # scaled_blocks_channel is num_active_bfus_for_prep long
 
-        is_long_block_for_bit_alloc_table = not (
-            block_size_mode.low_band_short
-            or block_size_mode.mid_band_short
-            or block_size_mode.high_band_short
-        )
-
+        # header_control_bits is fixed for the frame
         header_control_bits = 2 + 2 + 2 + 2 + constants.BITS_PER_BFU_AMOUNT_TAB_IDX + 2 + 3
-        wl_header_bits = num_active_bfus * constants.BITS_PER_IDWL
-        sf_header_bits = num_active_bfus * constants.BITS_PER_IDSF
-
         total_frame_bits = constants.SOUND_UNIT_SIZE * 8
-        bits_available_for_mantissas = (
-            total_frame_bits - header_control_bits - wl_header_bits - sf_header_bits
-        )
+        # FRAME_TRAILER_BITS are also fixed.
+        # wl_header_bits, sf_header_bits, and bits_available_for_mantissas are now calculated inside perform_iterative_allocation.
 
-        # Log bit allocation parameters
-        log_debug("BIT_ALLOC_PARAMS", "params", [bits_available_for_mantissas, spread_factor],
+        log_debug("BIT_ALLOC_PARAMS", "params",
+                  {"spread_factor": spread_factor, "initial_bfu_amount_idx": initial_bfu_amount_idx,
+                   "total_frame_bits": total_frame_bits, "header_control_bits": header_control_bits,
+                   "FRAME_TRAILER_BITS": constants.FRAME_TRAILER_BITS},
                   channel=channel_idx, frame=frame_idx,
-                  algorithm="bit_allocation", is_long_block=is_long_block_for_bit_alloc_table,
-                  bits_available=bits_available_for_mantissas, spread_factor=spread_factor)
+                  algorithm="bit_allocation_setup",
+                  block_size_mode_low_short=block_size_mode.low_band_short,
+                  block_size_mode_mid_short=block_size_mode.mid_band_short,
+                  block_size_mode_high_short=block_size_mode.high_band_short,
+                  spread_factor_val=spread_factor)
 
-        word_lengths_channel_full, mantissa_bits_used = (
+        # scaled_blocks_channel and ath_for_comparison_per_bfu are sized for num_active_bfus_for_prep.
+        word_lengths_channel_full, mantissa_bits_used, final_bfu_idx = (
             self.bit_allocator.perform_iterative_allocation(
-                scaled_blocks_channel,
-                is_long_block_for_bit_alloc_table,
-                ath_per_bfu_scaled,
+                scaled_blocks_channel, # List of ScaledBlock, length num_active_bfus_for_prep
+                block_size_mode,
+                ath_for_comparison_per_bfu, # List of float, length num_active_bfus_for_prep
                 spread_factor,
-                num_active_bfus,
-                bits_available_for_mantissas,
+                initial_bfu_amount_idx, # The starting bfu_amount_idx
+                total_frame_bits, # Total bits in the sound unit
+                header_control_bits, # Bits for fixed headers
+                constants.FRAME_TRAILER_BITS # Bits for trailer
             )
-        )
+        ) # word_lengths_channel_full is MAX_BFUS long.
         
-        # Log bit allocation results
-        log_debug("BIT_ALLOC", "word_lengths", word_lengths_channel_full,
-                  channel=channel_idx, frame=frame_idx,
-                  algorithm="bit_allocation", mantissa_bits_used=mantissa_bits_used,
-                  num_active_bfus=num_active_bfus)
+        final_num_active_bfus = self.codec_data.bfu_amount_tab[final_bfu_idx]
 
-        surplus_bits = bits_available_for_mantissas - mantissa_bits_used
-        boosted_word_lengths_channel_full = list(word_lengths_channel_full)
+        log_debug("BIT_ALLOC", "word_lengths", word_lengths_channel_full, # MAX_BFUS long
+                  channel=channel_idx, frame=frame_idx,
+                  algorithm="bit_allocation_result", active_mantissa_bits=mantissa_bits_used,
+                  final_bfu_idx=final_bfu_idx, num_active_bfus=final_num_active_bfus)
+
+        # Bit Boosting: Calculate surplus based on final_num_active_bfus
+        wl_header_bits_final = final_num_active_bfus * constants.BITS_PER_IDWL
+        sf_header_bits_final = final_num_active_bfus * constants.BITS_PER_IDSF
+        bits_available_for_mantissas_final = (
+            total_frame_bits - header_control_bits - constants.FRAME_TRAILER_BITS -
+            wl_header_bits_final - sf_header_bits_final
+        )
+        surplus_bits = bits_available_for_mantissas_final - mantissa_bits_used
+
+        boosted_word_lengths_channel_full = list(word_lengths_channel_full) # Copy MAX_BFUS long list
         if surplus_bits > 0:
             boosted_word_lengths_channel_full, _ = self.bits_booster.apply_boost(
-                boosted_word_lengths_channel_full, surplus_bits, num_active_bfus
+                boosted_word_lengths_channel_full, surplus_bits, final_num_active_bfus # Pass final_num_active_bfus
             )
 
-        final_word_lengths = boosted_word_lengths_channel_full[:num_active_bfus]
+        # final_word_lengths_active is the boosted list, sliced to final_num_active_bfus
+        final_word_lengths_active = boosted_word_lengths_channel_full[:final_num_active_bfus]
 
         quantized_mantissas_channel: List[List[int]] = []
-        for i in range(num_active_bfus):
-            if i < len(scaled_blocks_channel) and final_word_lengths[i] > 0:
+        for i in range(final_num_active_bfus): # Loop up to final_num_active_bfus
+            # scaled_blocks_channel was prepared for num_active_bfus_for_prep.
+            # final_num_active_bfus <= num_active_bfus_for_prep should hold.
+            if i < len(scaled_blocks_channel) and final_word_lengths_active[i] > 0: # Use final_word_lengths_active
                 scaled_values = scaled_blocks_channel[i].values
-                wl = final_word_lengths[i]
+                wl = final_word_lengths_active[i] # Use final_word_lengths_active
                 mantissas, _, _ = quantize_mantissas(
                     scaled_values, wl, perform_energy_adjustment=True
                 )
@@ -341,27 +324,36 @@ class Atrac1Encoder:
                 quantized_mantissas_channel.append([0] * bfu_size)
 
         frame_data_channel = Atrac1FrameData()
-        frame_data_channel.bsm_low = 2 if transient_low else 0
-        frame_data_channel.bsm_mid = 2 if transient_mid else 0
-        frame_data_channel.bsm_high = 3 if transient_high else 0
+        # bsm_X_val were calculated earlier: e.g., bsm_low_val = 0 if transient_low else 2
+        # Frame data fields should be consistent: 0 for SHORT, 2 for LONG_A, 3 for LONG_B.
+        frame_data_channel.bsm_low = bsm_low_val
+        frame_data_channel.bsm_mid = bsm_mid_val
+        frame_data_channel.bsm_high = bsm_high_val # high band long is 3
 
-        frame_data_channel.bfu_amount_idx = chosen_bfu_amount_idx
-        frame_data_channel.num_active_bfus = num_active_bfus
-        frame_data_channel.word_lengths = final_word_lengths
+        frame_data_channel.bfu_amount_idx = final_bfu_idx
+        frame_data_channel.num_active_bfus = final_num_active_bfus
+        frame_data_channel.word_lengths = final_word_lengths_active # Use active slice of boosted word lengths
+
+        # Scale factors should correspond to the final_num_active_bfus
+        # scaled_blocks_channel was prepared for num_active_bfus_for_prep.
         frame_data_channel.scale_factor_indices = [
-            sb.scale_factor_index for sb in scaled_blocks_channel if sb
+            sb.scale_factor_index for sb in scaled_blocks_channel[:final_num_active_bfus]
         ]
-        frame_data_channel.quantized_mantissas = quantized_mantissas_channel
+        frame_data_channel.quantized_mantissas = quantized_mantissas_channel # Already correctly sized
         
         # Log final frame data before bitstream writing
-        scale_factors = [sb.scale_factor_index for sb in scaled_blocks_channel if sb]
-        frame_structure = [chosen_bfu_amount_idx, bsm_low_val, bsm_mid_val, bsm_high_val]
-        log_debug("FRAME_DATA", "structure", frame_structure,
+        log_scale_factors = [sb.scale_factor_index for sb in scaled_blocks_channel[:final_num_active_bfus]]
+        # bsm_low_val, etc. are used for logging as they match atracdenc log format.
+        frame_structure_log = [final_bfu_idx,
+                               bsm_low_val,
+                               bsm_mid_val,
+                               bsm_high_val]
+        log_debug("FRAME_DATA", "structure", frame_structure_log,
                   channel=channel_idx, frame=frame_idx,
-                  algorithm="frame_assembly", num_active_bfus=num_active_bfus,
-                  bfu_amount_idx=chosen_bfu_amount_idx, 
-                  word_lengths_count=len(final_word_lengths),
-                  scale_factors_count=len(scale_factors))
+                  algorithm="frame_assembly", num_active_bfus=final_num_active_bfus,
+                  bfu_amount_idx=final_bfu_idx,
+                  word_lengths_count=len(final_word_lengths_active),
+                  scale_factors_count=len(log_scale_factors))
 
         encoded_bytes = self.bitstream_writer.write_frame(frame_data_channel)
         
