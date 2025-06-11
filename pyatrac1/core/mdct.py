@@ -36,13 +36,18 @@ def vector_fmul_window(dst: np.ndarray, src0: np.ndarray, src1: np.ndarray, win:
 
 def calc_sin_cos(n, scale):
     tmp = np.zeros(n // 2, dtype=np.float32)  # Use 32-bit to match atracdenc
-    alpha = 2.0 * math.pi / (8.0 * n)
-    omega = 2.0 * math.pi / n
-    scale = np.sqrt(scale / n)
+    alpha = 2.0 * np.pi / (8.0 * n)  # Use np.pi for consistency
+    omega = 2.0 * np.pi / n      # Use np.pi for consistency
+    # Ensure scale is float32 for sqrt operation if it comes from an integer context
+    # and to maintain precision similar to C++ float
+    current_scale = np.float32(scale)
+    current_scale = np.sqrt(current_scale / np.float32(n))
 
     for i in range(n // 4):
-        tmp[2 * i] = scale * np.cos(omega * i + alpha)
-        tmp[2 * i + 1] = scale * np.sin(omega * i + alpha)
+        # Ensure intermediate calculations are also float32
+        angle_val = omega * np.float32(i) + alpha
+        tmp[2 * i] = current_scale * np.cos(angle_val)
+        tmp[2 * i + 1] = current_scale * np.sin(angle_val)
 
     return tmp
 
@@ -59,146 +64,264 @@ class MDCT(NMDCTBase):
             scale = n
         super().__init__(n, n // 2, scale)
 
-    def __call__(self, input):
+    def __call__(self, input_signal: np.ndarray): # Renamed for clarity, ensure it's float32
+        # Ensure input is float32, as C++ version uses float*
+        input_signal = input_signal.astype(np.float32, copy=False)
+
         n2 = self.N // 2
         n4 = self.N // 4
         n34 = 3 * n4
-        n54 = 5 * n4
-        cos_values = self.SinCos[0::2]
-        sin_values = self.SinCos[1::2]
-        size = n2 // 2
-        real = np.zeros(size, dtype=np.float32)  # Use 32-bit to match atracdenc
-        imag = np.zeros(size, dtype=np.float32)  # Use 32-bit to match atracdenc
+        # n54 = 5 * n4 # n54 is used in the second loop for IMDCT, not MDCT in C++
+
+        # C++ version:
+        # const float* cos_ptr = &SinCos[0];
+        # const float* sin_ptr = &SinCos[1];
+        # Access pattern: cos_ptr[n], sin_ptr[n] where n increments by 2.
+        # This means it accesses SinCos[0], SinCos[1] for n=0
+        # SinCos[2], SinCos[3] for n=2 etc.
+        # Python SinCos is already [c0,s0,c1,s1,...]
+        # So cos_values[idx] from Python (where idx = k/2) corresponds to SinCos[k] in C++
+        # and sin_values[idx] from Python corresponds to SinCos[k+1] in C++
+
+        # The FFTIn buffer in C++ is of size N/4 complex pairs (N/2 floats)
+        # kiss_fft_cpx* FFTIn; (allocated for N/4 complex numbers)
+        # xr = (float*)FFTIn;
+        # xi = (float*)FFTIn + 1;
+        # xr[n], xi[n] in C++ means FFTIn[n/2].r and FFTIn[n/2].i if FFTIn was complex array
+        # However, it's more like xr are even indices, xi are odd indices of a float array view
+        # The loop for n goes up to n2 (N/2), with step 2.
+        # So, xr[n] and xi[n] are accessed for n = 0, 2, ..., (N/2 - 2)
+        # This means FFTIn has N/4 real parts and N/4 imaginary parts.
+        # Python `real` and `imag` arrays are of size N/4 (size = n2 // 2 = (N/2)//2 = N/4)
+
+        fft_in_real = np.zeros(n4, dtype=np.float32) # Equivalent to xr in C++ (N/4 elements)
+        fft_in_imag = np.zeros(n4, dtype=np.float32) # Equivalent to xi in C++ (N/4 elements)
 
         # First loop - pre-rotation stage
+        # C++ loop: for (n = 0; n < n4; n += 2)
+        # Python: for idx, k in enumerate(range(0, n4, 2)):
+        # Here k is equivalent to C++ n. idx is k/2.
         pre_rotation_debug = []
-        for idx, k in enumerate(range(0, n4, 2)):
-            r0 = input[n34 - 1 - k] + input[n34 + k]
-            i0 = input[n4 + k] - input[n4 - 1 - k]
-            c = cos_values[idx]
-            s = sin_values[idx]
-            real[idx] = r0 * c + i0 * s
-            imag[idx] = i0 * c - r0 * s
+        for n_loop_var in range(0, n4, 2): # n_loop_var corresponds to 'n' in C++
+            idx_fft = n_loop_var // 2 # index for fft_in_real, fft_in_imag
             
-            # Collect debug data for first few samples (match atracdenc)
-            if k < 8:
-                pre_rotation_debug.extend([r0, i0, c, s, real[idx], imag[idx]])
+            # C++: r0 = in[n34 - 1 - n] + in[n34 + n];
+            # C++: i0 = in[n4 + n] - in[n4 - 1 - n];
+            r0 = input_signal[n34 - 1 - n_loop_var] + input_signal[n34 + n_loop_var]
+            i0 = input_signal[n4 + n_loop_var] - input_signal[n4 - 1 - n_loop_var]
+
+            # C++: c = cos[n]; s = sin[n]; (where cos is &SinCos[0], sin is &SinCos[1])
+            # This means c = SinCos[n_loop_var*2 / 2 * 2] = SinCos[n_loop_var] (if SinCos was [c0,s0,c1,s1...])
+            # Correct C++ access: c = SinCos[n_loop_var], s = SinCos[n_loop_var + 1]
+            # Python's SinCos is already [c0,s0, c2,s2, ... ] (scaled) for indices 0,1,2,3...
+            # Python's original: cos_values = self.SinCos[0::2], sin_values = self.SinCos[1::2]
+            # c = cos_values[idx] = self.SinCos[2*idx] = self.SinCos[n_loop_var]
+            # s = sin_values[idx] = self.SinCos[2*idx+1] = self.SinCos[n_loop_var+1]
+            c = self.SinCos[n_loop_var]
+            s = self.SinCos[n_loop_var + 1]
+
+            # C++: xr[n] = r0 * c + i0 * s; xi[n] = i0 * c - r0 * s;
+            # Python: fft_in_real[idx_fft], fft_in_imag[idx_fft]
+            fft_in_real[idx_fft] = r0 * c + i0 * s
+            fft_in_imag[idx_fft] = i0 * c - r0 * s
+
+            if n_loop_var < 8: # Match C++ debug condition
+                pre_rotation_debug.extend([r0, i0, c, s, fft_in_real[idx_fft], fft_in_imag[idx_fft]])
         
-        # Log scale parameter for this transform
         debug_logger.log_stage("MDCT_SCALE_CURRENT", "value", [float(self.Scale)], 
                              frame=0, band="DEBUG", algorithm="mdct_internal", operation="current_scale", transform_size=self.N)
-        
-        # Log pre-rotation stage to match atracdenc
         debug_logger.log_stage("MDCT_PRE_ROTATION", "values", pre_rotation_debug[:24], 
                              frame=0, band="DEBUG", algorithm="mdct_internal", operation="pre_rotation")
 
         # Second loop
-        for idx, k in enumerate(range(n4, n2, 2), start=size // 2):
-            r0 = input[n34 - 1 - k] - input[k - n4]
-            i0 = input[n4 + k] + input[n54 - 1 - k]
-            c = cos_values[idx]
-            s = sin_values[idx]
-            real[idx] = r0 * c + i0 * s
-            imag[idx] = i0 * c - r0 * s
+        # C++ loop: for (; n < n2; n += 2) (n continues from n4)
+        # Python: for idx, k in enumerate(range(n4, n2, 2), start=size // 2):
+        # k corresponds to C++ n. idx is k/2.
+        for n_loop_var in range(n4, n2, 2): # n_loop_var corresponds to 'n' in C++
+            idx_fft = n_loop_var // 2 # index for fft_in_real, fft_in_imag
 
-        # Log FFT input (interleaved real/imag to match atracdenc format)
+            # C++: r0 = in[n34 - 1 - n] - in[n - n4];
+            # C++: i0 = in[n4 + n]    + in[n54 - 1 - n]; (n54 used here)
+            # Python's original n54 was commented out, let's define it for MDCT too.
+            n54 = 5 * n4 # This was missing in Python MDCT, present in IMDCT and C++ MDCT
+            r0 = input_signal[n34 - 1 - n_loop_var] - input_signal[n_loop_var - n4]
+            i0 = input_signal[n4 + n_loop_var] + input_signal[n54 - 1 - n_loop_var]
+
+            c = self.SinCos[n_loop_var]
+            s = self.SinCos[n_loop_var + 1]
+
+            fft_in_real[idx_fft] = r0 * c + i0 * s
+            fft_in_imag[idx_fft] = i0 * c - r0 * s
+
         fft_input_debug = []
-        for i in range(min(8, len(real))):
-            fft_input_debug.extend([real[i], imag[i]])
-        debug_logger.log_stage("MDCT_FFT_INPUT", "complex", fft_input_debug, 
+        for i in range(min(8, len(fft_in_real))): # Log N/4 complex numbers, so 8 pairs = 16 floats
+            fft_input_debug.extend([fft_in_real[i], fft_in_imag[i]])
+        debug_logger.log_stage("MDCT_FFT_INPUT", "complex", fft_input_debug, # C++ logs min(16, n2) floats -> min(8, n4) complex pairs
                              frame=0, band="DEBUG", algorithm="mdct_internal", operation="fft_input")
 
-        # Perform FFT
-        complex_input = real + 1j * imag
-        fft_result = np.fft.fft(complex_input)
-        real_fft = fft_result.real
-        imag_fft = fft_result.imag
+        # Perform FFT on N/4 complex samples
+        # C++ uses kiss_fft(FFTPlan, FFTIn, FFTOut) where FFTPlan is for N/4 points.
+        complex_input = fft_in_real + 1j * fft_in_imag # Array of N/4 complex numbers
+        fft_result = np.fft.fft(complex_input) # Output is also N/4 complex numbers
+
+        # C++: xr = (float*)FFTOut; xi = (float*)FFTOut + 1;
+        # real_fft and imag_fft are arrays of N/4 floats each.
+        real_fft_out = fft_result.real.astype(np.float32)
+        imag_fft_out = fft_result.imag.astype(np.float32)
         
-        # Log FFT output (interleaved real/imag to match atracdenc format)
         fft_output_debug = []
-        for i in range(min(8, len(real_fft))):
-            fft_output_debug.extend([real_fft[i], imag_fft[i]])
-        debug_logger.log_stage("MDCT_FFT_OUTPUT", "complex", fft_output_debug, 
+        for i in range(min(8, len(real_fft_out))): # Log N/4 complex numbers
+            fft_output_debug.extend([real_fft_out[i], imag_fft_out[i]])
+        debug_logger.log_stage("MDCT_FFT_OUTPUT", "complex", fft_output_debug, # C++ logs min(16, n2) floats
                              frame=0, band="DEBUG", algorithm="mdct_internal", operation="fft_output")
 
         # Output - post-rotation stage
+        # C++ loop: for (n = 0; n < n2; n += 2)
+        # Python: for idx, k in enumerate(range(0, n2, 2)):
+        # k corresponds to C++ n. idx is k/2.
+        # Buf is size N/2
         post_rotation_debug = []
-        for idx, k in enumerate(range(0, n2, 2)):
-            r0 = real_fft[idx]
-            i0 = imag_fft[idx]
-            c = cos_values[idx]
-            s = sin_values[idx]
-            self.buf[k] = -r0 * c - i0 * s
-            self.buf[n2 - 1 - k] = -r0 * s + i0 * c
+        for n_loop_var in range(0, n2, 2): # n_loop_var corresponds to 'n' in C++
+            idx_fft = n_loop_var // 2 # index for real_fft_out, imag_fft_out (which are N/4 long)
+                                      # and also for cos/sin access from SinCos table (using n_loop_var)
+
+            # C++: r0 = xr[n]; i0 = xi[n];
+            # This implies xr and xi are views into FFTOut, which has N/4 complex (N/2 float) values.
+            # xr[n] means FFTOut[n/2].r, xi[n] means FFTOut[n/2].i
+            r0 = real_fft_out[idx_fft]
+            i0 = imag_fft_out[idx_fft]
+
+            # C++: c = cos[n]; s = sin[n];
+            c = self.SinCos[n_loop_var]
+            s = self.SinCos[n_loop_var + 1]
             
-            # Collect debug data for first few samples (match atracdenc)
-            if k < 8:
-                post_rotation_debug.extend([r0, i0, c, s, self.buf[k], self.buf[n2 - 1 - k]])
+            # C++: Buf[n] = - r0 * c - i0 * s;
+            # C++: Buf[n2 - 1 -n] = - r0 * s + i0 * c;
+            # Python self.buf is N/2. C++ Buf is N/2.
+            # n_loop_var is the index for self.buf here.
+            self.buf[n_loop_var] = -r0 * c - i0 * s
+            self.buf[n2 - 1 - n_loop_var] = -r0 * s + i0 * c
+
+            if n_loop_var < 8: # Match C++ debug condition
+                post_rotation_debug.extend([r0, i0, c, s, self.buf[n_loop_var], self.buf[n2 - 1 - n_loop_var]])
         
-        # Log post-rotation stage to match atracdenc
         debug_logger.log_stage("MDCT_POST_ROTATION", "values", post_rotation_debug[:24], 
                              frame=0, band="DEBUG", algorithm="mdct_internal", operation="post_rotation")
 
-        return self.buf
+        return self.buf.astype(np.float32) # Ensure output is float32
 
 class IMDCT(NMDCTBase):
     def __init__(self, n, scale=None):
         if scale is None:
-            scale = n
-        super().__init__(n, n, scale / 2)
+            scale = n # Default scale for IMDCT in C++ is TN (which is N here)
+        # C++ TMIDCT constructor: TMDCTBase(TN, scale/2)
+        # Python: super().__init__(n, n, scale / 2) -> N=n, L=n, base_scale = scale/2
+        # This seems correct.
+        super().__init__(n, n, np.float32(scale) / 2.0) # L=N for IMDCT output, ensure float division
 
-    def __call__(self, input):
+    def __call__(self, input_coeffs: np.ndarray): # Renamed for clarity, ensure it's float32
+        # Ensure input is float32
+        input_coeffs = input_coeffs.astype(np.float32, copy=False)
+
         n2 = self.N // 2
         n4 = self.N // 4
         n34 = 3 * n4
-        n54 = 5 * n4
+        n54 = 5 * n4 # Used in the second output loop
 
-        cos_values = self.SinCos[0::2]
-        sin_values = self.SinCos[1::2]
+        # SinCos access pattern similar to MDCT
+        # const float* cos = &SinCos[0];
+        # const float* sin = &SinCos[1];
 
-        size = n2 // 2
-        real = np.zeros(size, dtype=np.float32)  # Use 32-bit to match atracdenc
-        imag = np.zeros(size, dtype=np.float32)  # Use 32-bit to match atracdenc
+        # FFTIn buffer in C++ is N/4 complex pairs (N/2 floats)
+        # FFTPlan is for N/4 points.
+        fft_in_real = np.zeros(n4, dtype=np.float32) # N/4 elements
+        fft_in_imag = np.zeros(n4, dtype=np.float32) # N/4 elements
 
-        # Prepare input for FFT
-        for idx, k in enumerate(range(0, n2, 2)):
-            r0 = input[k]
-            i0 = input[n2 - 1 - k]
-            c = cos_values[idx]
-            s = sin_values[idx]
-            real[idx] = -2.0 * (i0 * s + r0 * c)
-            imag[idx] = -2.0 * (i0 * c - r0 * s)
+        # Prepare input for FFT (Pre-IFFT rotation)
+        # C++ loop: for (n = 0; n < n2; n += 2)
+        # Python: for idx, k in enumerate(range(0, n2, 2)):
+        # k corresponds to C++ n. idx is k/2.
+        for n_loop_var in range(0, n2, 2): # n_loop_var corresponds to 'n' in C++
+            idx_fft = n_loop_var // 2 # index for fft_in_real, fft_in_imag
 
-        # Perform FFT
-        complex_input = real + 1j * imag
-        fft_result = np.fft.fft(complex_input)
-        real_fft = fft_result.real
-        imag_fft = fft_result.imag
+            # C++: r0 = in[n]; i0 = in[n2 - 1 - n];
+            r0 = input_coeffs[n_loop_var]
+            i0 = input_coeffs[n2 - 1 - n_loop_var]
 
-        # Output
-        for idx, k in enumerate(range(0, n4, 2)):
-            r0 = real_fft[idx]
-            i0 = imag_fft[idx]
-            c = cos_values[idx]
-            s = sin_values[idx]
+            # C++: c = cos[n]; s = sin[n];
+            c = self.SinCos[n_loop_var]
+            s = self.SinCos[n_loop_var + 1]
+
+            # C++: xr[n] = -2.0 * (i0 * s + r0 * c);
+            # C++: xi[n] = -2.0 * (i0 * c - r0 * s);
+            # xr[n] means FFTIn[n/2].r, xi[n] means FFTIn[n/2].i
+            fft_in_real[idx_fft] = -2.0 * (i0 * s + r0 * c)
+            fft_in_imag[idx_fft] = -2.0 * (i0 * c - r0 * s)
+
+        # Perform FFT (actually IFFT, but kiss_fft can be configured for inverse)
+        # np.fft.fft is used. The C++ code uses kiss_fft with is_inverse_fft=false.
+        # The surrounding scaling and conjugation might handle the direct/inverse transform differences.
+        # For now, assume np.fft.fft is the target, and ensure logic matches.
+        complex_input = fft_in_real + 1j * fft_in_imag # Array of N/4 complex numbers
+        fft_result = np.fft.fft(complex_input) # Output is also N/4 complex numbers
+
+        # C++: xr = (float*)FFTOut; xi = (float*)FFTOut + 1;
+        real_fft_out = fft_result.real.astype(np.float32)
+        imag_fft_out = fft_result.imag.astype(np.float32)
+
+        # Output stage (Post-IFFT rotation and reconstruction)
+        # Buf is size N for IMDCT
+        # First C++ loop: for (n = 0; n < n4; n += 2)
+        for n_loop_var in range(0, n4, 2): # n_loop_var corresponds to 'n' in C++
+            idx_fft = n_loop_var // 2 # index for real_fft_out, imag_fft_out
+
+            # C++: r0 = xr[n]; i0 = xi[n];
+            r0 = real_fft_out[idx_fft]
+            i0 = imag_fft_out[idx_fft]
+
+            # C++: c = cos[n]; s = sin[n];
+            c = self.SinCos[n_loop_var]
+            s = self.SinCos[n_loop_var + 1]
+
             r1 = r0 * c + i0 * s
-            i1 = r0 * s - i0 * c
-            self.buf[n34 - 1 - k] = r1
-            self.buf[n34 + k] = r1
-            self.buf[n4 + k] = i1
-            self.buf[n4 - 1 - k] = -i1
+            i1 = r0 * s - i0 * c # Note: C++ has i1 = r0*s - i0*c. Python was i0*s - r0*c. This needs to match.
 
-        for idx, k in enumerate(range(n4, n2, 2), start=size // 2):
-            r0 = real_fft[idx]
-            i0 = imag_fft[idx]
-            c = cos_values[idx]
-            s = sin_values[idx]
+            # C++ assignments:
+            # Buf[n34 - 1 - n] = r1;
+            # Buf[n34 + n] = r1;
+            # Buf[n4 + n] = i1;
+            # Buf[n4 - 1 - n] = -i1;
+            self.buf[n34 - 1 - n_loop_var] = r1
+            self.buf[n34 + n_loop_var] = r1
+            self.buf[n4 + n_loop_var] = i1
+            self.buf[n4 - 1 - n_loop_var] = -i1
+
+        # Second C++ loop: for (; n < n2; n += 2) (n continues from n4)
+        for n_loop_var in range(n4, n2, 2): # n_loop_var corresponds to 'n' in C++
+            idx_fft = n_loop_var // 2 # index for real_fft_out, imag_fft_out
+
+            # C++: r0 = xr[n]; i0 = xi[n];
+            r0 = real_fft_out[idx_fft]
+            i0 = imag_fft_out[idx_fft]
+
+            # C++: c = cos[n]; s = sin[n];
+            c = self.SinCos[n_loop_var]
+            s = self.SinCos[n_loop_var + 1]
+
             r1 = r0 * c + i0 * s
-            i1 = r0 * s - i0 * c
-            self.buf[n34 - 1 - k] = r1
-            self.buf[k - n4] = -r1
-            self.buf[n4 + k] = i1
-            self.buf[n54 - 1 - k] = i1
+            i1 = r0 * s - i0 * c # Match C++
+
+            # C++ assignments:
+            # Buf[n34 - 1 - n] = r1;
+            # Buf[n - n4] = -r1;
+            # Buf[n4 + n] = i1;
+            # Buf[n54 - 1 - n] = i1;
+            self.buf[n34 - 1 - n_loop_var] = r1
+            self.buf[n_loop_var - n4] = -r1       # Corrected index from Python's k-n4
+            self.buf[n4 + n_loop_var] = i1
+            self.buf[n54 - 1 - n_loop_var] = i1
+
+        return self.buf.astype(np.float32) # Ensure output is float32
 
         return self.buf
 
@@ -282,10 +405,10 @@ class Atrac1MDCT:
         ]
         
         
-        # Initialize atracdenc-compatible sine window
-        self.SINE_WINDOW = [0.0] * 32
-        for i in range(32):
-            self.SINE_WINDOW[i] = np.sin((i + 0.5) * (np.pi / (2.0 * 32.0)))
+        # Initialize atracdenc-compatible sine window and store as float32 numpy array
+        self.SINE_WINDOW = np.array([
+            np.sin((i + 0.5) * (np.pi / (2.0 * 32.0))) for i in range(32)
+        ], dtype=np.float32)
     
     def initialize_windowing_state(self, channel: int = 0):
         """
@@ -613,12 +736,12 @@ class Atrac1MDCT:
                 temp_dst = np.zeros(32, dtype=np.float32)  # 2 * 16 = 32
                 temp_src1 = inv_buf[start:start + 16]
                 
-                # ATRACDENC ALIGNMENT: Ensure np.float32 sine window for vector_fmul_window
+                # Pass the pre-converted SINE_WINDOW numpy array
                 vector_fmul_window(
-                    temp_dst,  # dst (will use indices -16 to 15)
+                    temp_dst,  # dst (will use indices 0 to 31 in Python version)
                     prev_buf,  # src0
                     temp_src1,  # src1
-                    np.array(self.SINE_WINDOW, dtype=np.float32),
+                    self.SINE_WINDOW, # Already a np.float32 array
                     16
                 )
                 

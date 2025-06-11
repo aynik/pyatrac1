@@ -44,6 +44,12 @@ ATH_LOOKUP_TABLE = [
     (25118.9, 9999, 9999, 9999, 9999),
 ]
 
+# Flattened ATH lookup table for Frank's formula, matching C++ static short tab[]
+# Each entry from ATH_LOOKUP_TABLE contributes its 4 data values consecutively.
+FLAT_ATH_TAB_FRANK: list[int] = []
+for entry in ATH_LOOKUP_TABLE:
+    FLAT_ATH_TAB_FRANK.extend(entry[1:]) # Add v1, v2, v3, v4
+
 
 def generate_loudness_curve() -> list[float]:
     """

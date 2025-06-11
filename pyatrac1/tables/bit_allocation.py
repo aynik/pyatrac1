@@ -50,7 +50,7 @@ FIXED_BIT_ALLOC_TABLE_LONG = [
     3,
     3,
     3,
-    1,
+    2, # Index 44 (0-based)
     1,
     1,
     1,
