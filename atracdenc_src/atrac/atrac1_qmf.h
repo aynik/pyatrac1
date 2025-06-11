@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include <vector> // Added to provide std::vector
 #include "../qmf/qmf.h"
 #include "../debug_logger.h"
 
